@@ -50,6 +50,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
+  // 初始化媒体与密钥
   useEffect(() => {
     const init = async () => {
       encryptionKeyRef.current = await deriveKey(config.passphrase, config.roomId);
@@ -84,23 +85,24 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     });
 
     pc.ontrack = (e) => {
-      addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] });
-      setConnectionStatus('connected');
+      addParticipant({ id: remoteId, name: "远端成员", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] });
     };
 
     pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') setConnectionStatus('connected');
-        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
             removeParticipant(remoteId);
-            setConnectionStatus('idle');
-            setRole('none');
-            setLocalSDP('');
-            setRemoteSDPInput('');
+            if (peersRef.current.size === 0) {
+                setConnectionStatus('idle');
+                setRole('none');
+                setLocalSDP('');
+                setRemoteSDPInput('');
+            }
         }
     };
 
     if (isOffer) {
-      const dc = pc.createDataChannel('secure-transfer', { ordered: true });
+      const dc = pc.createDataChannel('secure-tunnel', { ordered: true });
       setupDataChannel(remoteId, dc);
     } else {
       pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel);
@@ -119,12 +121,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             const text = await decryptMessage(encryptionKeyRef.current, payload.data, payload.iv);
             setMessages(prev => [...prev, { id: Date.now().toString(), senderId: remoteId, senderName: 'Peer', text, timestamp: Date.now() }]);
           } else if (payload.type === 'file-meta') handleFileMetaReceive(payload);
-        } catch (err) { console.error("DC message error:", err); }
+        } catch (err) { console.error("Data processing error:", err); }
       } else handleFileChunkReceive(e.data);
     };
   };
 
-  // ---------------- 发起方业务流 ----------------
+  // ---------------- 握手逻辑流 ----------------
+
+  // 发起方：生成 Offer
   const startAsInitiator = async () => {
     setRole('initiator');
     setConnectionStatus('preparing');
@@ -138,13 +142,13 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         setConnectionStatus('ready');
       }
     };
-    // 兼容部分浏览器不触发事件的情况
     if (pc.iceGatheringState === 'complete') {
         setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
         setConnectionStatus('ready');
     }
   };
 
+  // 发起方：完成最后一步 (回填 Answer)
   const finalizeAsInitiator = async () => {
     if (!remoteSDPInput) return;
     try {
@@ -152,21 +156,22 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const pc = peersRef.current.get('peer');
       if (pc && decoded.type === 'answer') {
         await pc.setRemoteDescription(new RTCSessionDescription(decoded));
+        // 连接状态将通过 onconnectionstatechange 自动更新
       } else {
-        alert("无效的回应包 (Answer)，请确认角色是否匹配。");
+        alert("无效的代码。发起方需要粘贴接收方发回的 Answer。");
       }
     } catch (e) {
-      alert("包解析失败，请确保代码复制完整。");
+      alert("代码解析失败，请确保复制完整。");
     }
   };
 
-  // ---------------- 接收方业务流 ----------------
-  const processOfferAndAnswer = async () => {
+  // 接收方：处理 Offer 并生成 Answer
+  const handleOfferAndReply = async () => {
     if (!remoteSDPInput) return;
     try {
       const decoded = JSON.parse(atob(remoteSDPInput));
       if (decoded.type !== 'offer') {
-        alert("无效的握手包 (Offer)，接收方必须粘贴发起方的代码。");
+        alert("代码类型错误。接收方必须粘贴发起方的 Offer。");
         return;
       }
       setRole('receiver');
@@ -187,7 +192,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         setConnectionStatus('ready');
       }
     } catch (e) {
-      alert("解析失败，请确认复制了完整的 Offer 代码。");
+      alert("解析失败，请检查 Offer 代码完整性。");
     }
   };
 
@@ -244,7 +249,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
         receivingFileRef.current = null;
       }
-    } catch (e) { console.error("Decryption error:", e); }
+    } catch (e) { console.error("File decryption error:", e); }
   };
 
   return (
@@ -254,8 +259,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           <div className="size-8 bg-primary/10 rounded-lg flex items-center justify-center border border-primary/20">
             <span className="material-symbols-outlined text-primary text-sm fill-1">verified_user</span>
           </div>
-          <div className="hidden xs:block">
-            <h2 className="text-[10px] font-black tracking-widest text-gray-500 uppercase">SERVERLESS P2P TERMINAL</h2>
+          <div>
+            <h2 className="text-[10px] font-black tracking-widest text-gray-500 uppercase">SERVERLESS P2P PROTOCOL</h2>
             <div className="flex items-center gap-1.5">
                <span className={`size-1.5 rounded-full ${connectionStatus === 'connected' ? 'bg-accent shadow-[0_0_8px_#22c55e]' : 'bg-yellow-500 animate-pulse'}`}></span>
                <span className="text-[9px] font-bold text-white uppercase tracking-wider">{connectionStatus.toUpperCase()}</span>
@@ -268,14 +273,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       <main className="flex-1 flex overflow-hidden relative p-2 pt-0">
         <div className="flex-1 flex flex-col relative overflow-hidden">
           {connectionStatus !== 'connected' ? (
-            <div className="flex-1 flex flex-col items-center justify-center p-4 lg:p-12 space-y-8 lg:space-y-12 animate-in fade-in duration-700 overflow-y-auto custom-scrollbar">
+            <div className="flex-1 flex flex-col items-center justify-center p-4 lg:p-12 space-y-12 animate-in fade-in duration-700 overflow-y-auto custom-scrollbar">
                 
                 {role === 'none' ? (
                     <div className="text-center space-y-12 max-w-2xl animate-in zoom-in-95">
                         <div className="space-y-4">
-                            <h3 className="text-3xl lg:text-5xl font-black text-white tracking-tighter uppercase leading-tight">初始化安全链路</h3>
+                            <h3 className="text-3xl lg:text-5xl font-black text-white tracking-tighter uppercase leading-tight">请选择您的物理角色</h3>
                             <p className="text-gray-500 text-sm font-medium leading-relaxed max-w-lg mx-auto">
-                              应用当前运行在 <span className="text-primary font-bold">100% 物理隔离</span> 模式。请选择您的会话角色以开始手动握手交换。
+                              P2P 链路建立需要双方各司其职。请与对端沟通并在此选择您的操作入口。
                             </p>
                         </div>
                         
@@ -285,11 +290,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                 className="group relative flex flex-col items-center justify-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-primary/10 hover:border-primary/40 hover:bg-primary/5 transition-all active:scale-95 shadow-xl"
                             >
                                 <div className="size-20 rounded-3xl bg-primary/10 flex items-center justify-center text-primary group-hover:scale-110 transition-transform">
-                                    <span className="material-symbols-outlined text-5xl">outbound</span>
+                                    <span className="material-symbols-outlined text-5xl">rocket_launch</span>
                                 </div>
                                 <div className="text-center">
                                     <h4 className="text-xl font-black text-white uppercase tracking-widest mb-2">我是发起方</h4>
-                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">INITIATOR / 创建 Offer</p>
+                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">INITIATOR / 生成代码</p>
                                 </div>
                             </button>
 
@@ -298,18 +303,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                 className="group relative flex flex-col items-center justify-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-accent/10 hover:border-accent/40 hover:bg-accent/5 transition-all active:scale-95 shadow-xl"
                             >
                                 <div className="size-20 rounded-3xl bg-accent/10 flex items-center justify-center text-accent group-hover:scale-110 transition-transform">
-                                    <span className="material-symbols-outlined text-5xl">call_received</span>
+                                    <span className="material-symbols-outlined text-5xl">join_inner</span>
                                 </div>
                                 <div className="text-center">
                                     <h4 className="text-xl font-black text-white uppercase tracking-widest mb-2">我是接收方</h4>
-                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">RECEIVER / 等待 Offer</p>
+                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">RECEIVER / 等待代码</p>
                                 </div>
                             </button>
                         </div>
                     </div>
                 ) : (
                     <div className="w-full max-w-4xl animate-in slide-in-from-bottom-10 duration-500">
-                        {/* 握手终端界面 */}
+                        {/* 手动交换终端 */}
                         <div className={`glass rounded-[3rem] p-8 lg:p-12 shadow-3xl bg-black/40 relative overflow-hidden flex flex-col gap-10 border-t-4 transition-all ${role === 'initiator' ? 'border-t-primary' : 'border-t-accent'}`}>
                             
                             <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
@@ -319,28 +324,26 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                     </button>
                                     <div>
                                         <h3 className="text-2xl font-black text-white tracking-tight uppercase">
-                                            {role === 'initiator' ? '发起方握手终端' : '接收方握手终端'}
+                                            {role === 'initiator' ? '发起方握手控制台' : '接收方握手控制台'}
                                         </h3>
                                         <p className="text-[9px] font-black text-gray-500 uppercase tracking-[0.3em]">
-                                            {role === 'initiator' ? 'OFFER GENERATION & CALLBACK' : 'INBOUND HANDSHAKE AWAIT'}
+                                            {role === 'initiator' ? 'OFFER & CALLBACK SYNC' : 'INBOUND OFFER PARSING'}
                                         </p>
                                     </div>
                                 </div>
                                 <div className="px-4 py-1.5 bg-white/5 border border-white/10 rounded-full flex items-center gap-2">
                                     <span className="size-2 rounded-full bg-yellow-500 animate-pulse"></span>
-                                    <span className="text-[9px] font-black text-gray-400 uppercase tracking-widest">等待链路同步</span>
+                                    <span className="text-[9px] font-black text-gray-400 uppercase tracking-widest">链路连接中...</span>
                                 </div>
                             </div>
 
-                            {/* 交互步骤区域 */}
-                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-12">
-                                
+                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
                                 {/* 步骤 01 */}
                                 <div className="flex flex-col gap-6">
                                     <div className="flex items-center gap-3">
-                                        <span className={`size-8 rounded-2xl flex items-center justify-center text-[11px] font-black border transition-colors ${role === 'initiator' ? 'bg-primary/20 text-primary border-primary/30' : 'bg-white/5 text-gray-500 border-white/10'}`}>01</span>
+                                        <span className={`size-8 rounded-2xl flex items-center justify-center text-[11px] font-black border ${role === 'initiator' ? 'bg-primary/20 text-primary border-primary/30' : 'bg-white/5 text-gray-500 border-white/10'}`}>01</span>
                                         <h4 className="text-xs font-black uppercase text-white tracking-widest">
-                                            {role === 'initiator' ? '复制并发送您的代码' : '粘贴对方的代码'}
+                                            {role === 'initiator' ? '发送您的握手包' : '粘贴对方的代码'}
                                         </h4>
                                     </div>
 
@@ -349,34 +352,34 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                             <div className="relative group flex-1 min-h-[160px]">
                                                 <textarea 
                                                     readOnly 
-                                                    value={localSDP || '计算加密特征中...'} 
+                                                    value={localSDP || '正在生成加密 Offer...'} 
                                                     className="w-full h-full bg-black/60 border border-primary/20 rounded-2xl p-4 text-[9px] font-mono text-primary outline-none resize-none custom-scrollbar" 
                                                 />
-                                                <div className="absolute top-2 right-2 px-2 py-0.5 bg-primary/20 border border-primary/30 rounded text-[8px] font-black text-primary uppercase">Offer Package</div>
+                                                <div className="absolute top-2 right-2 px-2 py-0.5 bg-primary/20 border border-primary/30 rounded text-[8px] font-black text-primary uppercase tracking-tighter">OFFER PKG</div>
                                             </div>
                                             <button 
                                                 onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}}
                                                 className="w-full h-12 bg-primary text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 transition-all shadow-lg shadow-primary/20"
                                             >
                                                 <span className="material-symbols-outlined text-sm">{isCopied ? 'check' : 'content_copy'}</span>
-                                                {isCopied ? '代码已复制' : '复制 Offer 包'}
+                                                {isCopied ? '已复制' : '复制 Offer 代码'}
                                             </button>
                                         </div>
                                     ) : (
                                         <div className="flex-1 flex flex-col gap-3">
                                             <textarea 
-                                                placeholder="在此粘贴发起方生成的代码 (Offer)..."
+                                                placeholder="在此粘贴发起方的代码 (Offer)..."
                                                 value={remoteSDPInput}
                                                 onChange={(e) => setRemoteSDPInput(e.target.value)}
                                                 className="flex-1 min-h-[160px] bg-black/60 border border-white/10 rounded-2xl p-4 text-[9px] font-mono text-accent outline-none focus:border-accent/40 resize-none transition-all placeholder:text-gray-700"
                                             />
                                             <button 
-                                                onClick={processOfferAndAnswer}
+                                                onClick={handleOfferAndReply}
                                                 disabled={!remoteSDPInput || connectionStatus === 'preparing'}
                                                 className="w-full h-12 bg-white/5 border border-white/10 hover:bg-white/10 text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 disabled:opacity-20 transition-all"
                                             >
                                                 <span className="material-symbols-outlined text-sm text-accent">bolt</span>
-                                                解析并生成回应
+                                                解析代码并回应
                                             </button>
                                         </div>
                                     )}
@@ -385,9 +388,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                 {/* 步骤 02 */}
                                 <div className="flex flex-col gap-6">
                                     <div className="flex items-center gap-3">
-                                        <span className={`size-8 rounded-2xl flex items-center justify-center text-[11px] font-black border transition-colors ${role === 'receiver' || (role === 'initiator' && remoteSDPInput) ? 'bg-accent/20 text-accent border-accent/30' : 'bg-white/5 text-gray-500 border-white/10'}`}>02</span>
+                                        <span className={`size-8 rounded-2xl flex items-center justify-center text-[11px] font-black border ${role === 'receiver' || (role === 'initiator' && remoteSDPInput) ? 'bg-accent/20 text-accent border-accent/30' : 'bg-white/5 text-gray-500 border-white/10'}`}>02</span>
                                         <h4 className="text-xs font-black uppercase text-white tracking-widest">
-                                            {role === 'initiator' ? '粘贴回应并完成连接' : '复制并回传回应代码'}
+                                            {role === 'initiator' ? '粘贴回执建立连接' : '回传您的回应包'}
                                         </h4>
                                     </div>
 
@@ -405,7 +408,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                                 className="w-full h-12 bg-accent text-black rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 disabled:opacity-20 transition-all shadow-lg shadow-accent/20"
                                             >
                                                 <span className="material-symbols-outlined text-sm">handshake</span>
-                                                建立隧道链路
+                                                激活安全隧道
                                             </button>
                                         </div>
                                     ) : (
@@ -413,10 +416,10 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                             <div className="relative group flex-1 min-h-[160px]">
                                                 <textarea 
                                                     readOnly 
-                                                    value={localSDP || '等待步骤 01 完成...'} 
+                                                    value={localSDP || '等待步骤 01 解析...'} 
                                                     className="w-full h-full bg-black/60 border border-accent/20 rounded-2xl p-4 text-[9px] font-mono text-accent outline-none resize-none custom-scrollbar" 
                                                 />
-                                                <div className="absolute top-2 right-2 px-2 py-0.5 bg-accent/20 border border-accent/30 rounded text-[8px] font-black text-accent uppercase">Answer Package</div>
+                                                <div className="absolute top-2 right-2 px-2 py-0.5 bg-accent/20 border border-accent/30 rounded text-[8px] font-black text-accent uppercase tracking-tighter">ANSWER PKG</div>
                                             </div>
                                             <button 
                                                 onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}}
@@ -424,7 +427,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                                 className="w-full h-12 bg-accent text-black rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 transition-all disabled:opacity-20 shadow-lg shadow-accent/20"
                                             >
                                                 <span className="material-symbols-outlined text-sm">{isCopied ? 'check' : 'content_copy'}</span>
-                                                {isCopied ? '代码已复制' : '复制回传代码'}
+                                                {isCopied ? '已复制' : '复制 Answer 代码'}
                                             </button>
                                         </div>
                                     )}
@@ -432,18 +435,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                             </div>
                             
                             <div className="pt-8 border-t border-white/5 opacity-50 flex flex-col md:flex-row items-center justify-between gap-4">
-                                <div className="flex items-center gap-6">
+                                <div className="flex items-center gap-8">
                                     <div className="space-y-0.5">
-                                        <p className="text-[7px] font-black text-white uppercase tracking-widest">安全特征</p>
-                                        <p className="text-[8px] font-mono text-gray-500 uppercase tracking-tighter">P2P-HANDSHAKE-DIRECT-LINK</p>
+                                        <p className="text-[7px] font-black text-white uppercase tracking-widest">物理特征</p>
+                                        <p className="text-[8px] font-mono text-gray-500 uppercase">SERVERLESS-ISOLATION-V1</p>
                                     </div>
                                     <div className="h-6 w-px bg-white/10 hidden md:block"></div>
                                     <div className="space-y-0.5">
-                                        <p className="text-[7px] font-black text-white uppercase tracking-widest">会话 ID</p>
+                                        <p className="text-[7px] font-black text-white uppercase tracking-widest">当前会话</p>
                                         <p className="text-[8px] font-mono text-gray-500 truncate max-w-[120px]">{config.roomId}</p>
                                     </div>
                                 </div>
-                                <p className="text-[8px] font-bold text-gray-600 uppercase tracking-[0.3em]">物理隔离协商协议 v1.2</p>
+                                <p className="text-[8px] font-bold text-gray-600 uppercase tracking-[0.3em]">物理隔离链路协商 v1.2</p>
                             </div>
                         </div>
                     </div>
@@ -475,7 +478,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         </div>
       </main>
 
-      {/* 底部控制栏 */}
+      {/* 底部控制面板 */}
       {connectionStatus === 'connected' && (
         <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 p-3 glass rounded-[2rem] z-[100] shadow-2xl shadow-black animate-in slide-in-from-bottom-10">
           <div className="flex items-center gap-1 bg-white/5 p-1 rounded-2xl mr-2">
@@ -544,8 +547,8 @@ const ChatBox = ({ messages, onSend, userName, files, onUpload }: { messages: Ch
               <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
               <span className="material-symbols-outlined">attach_file</span>
           </label>
-          <input className="flex-1 h-12 bg-white/5 border border-white/10 rounded-xl px-4 text-sm text-white focus:outline-none focus:border-primary/50 transition-all" placeholder="输入加密消息..." value={text} onChange={(e) => setText(e.target.value)} />
-          <button type="submit" disabled={!text.trim()} className="shrink-0 size-12 bg-primary text-white rounded-xl flex items-center justify-center disabled:opacity-30 disabled:grayscale transition-all shadow-lg shadow-primary/20"><span className="material-symbols-outlined">send</span></button>
+          <input className="flex-1 h-12 bg-white/5 border border-white/10 rounded-xl px-4 text-sm text-white focus:outline-none focus:border-primary/50 transition-all" placeholder="加密消息..." value={text} onChange={(e) => setText(e.target.value)} />
+          <button type="submit" disabled={!text.trim()} className="shrink-0 size-12 bg-primary text-white rounded-xl flex items-center justify-center disabled:opacity-30 transition-all shadow-lg shadow-primary/20"><span className="material-symbols-outlined">send</span></button>
         </form>
       </div>
     </div>
