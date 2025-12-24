@@ -9,6 +9,8 @@ interface RoomProps {
   onExit: () => void;
 }
 
+type HandshakeRole = 'none' | 'initiator' | 'receiver';
+
 const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -18,12 +20,15 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
-  const [wsStatus, setWsStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
   
-  // Mesh 架构核心：管理多个 Peer
+  // 核心连接状态
+  const [role, setRole] = useState<HandshakeRole>('none');
+  const [localSDP, setLocalSDP] = useState('');
+  const [remoteSDPInput, setRemoteSDPInput] = useState('');
+  const [connectionStatus, setConnectionStatus] = useState<'idle' | 'preparing' | 'ready' | 'connected'>('idle');
+
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
-  const wsRef = useRef<WebSocket | null>(null);
   const encryptionKeyRef = useRef<CryptoKey | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
 
@@ -37,12 +42,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
   const removeParticipant = useCallback((id: string) => {
     setParticipants(prev => prev.filter(u => u.id !== id));
-    peersRef.current.get(id)?.close();
-    peersRef.current.delete(id);
+    const pc = peersRef.current.get(id);
+    if (pc) {
+      pc.close();
+      peersRef.current.delete(id);
+    }
     dataChannelsRef.current.delete(id);
   }, []);
 
-  // 1. 初始化本地媒体和信令
   useEffect(() => {
     const init = async () => {
       encryptionKeyRef.current = await deriveKey(config.passphrase, config.roomId);
@@ -53,191 +60,163 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         });
         localStreamRef.current = stream;
         addParticipant({ id: 'local', name: config.userName, isLocal: true, isHost: true, audioEnabled: true, videoEnabled: true, stream });
-        
-        connectSignaling();
       } catch (err) {
-        alert("无法访问媒体设备，请检查权限。");
-        console.error("Media init error:", err);
+        console.error("Media access error:", err);
       }
     };
-
-    const connectSignaling = () => {
-      // 修复：显式判断协议，防止 blob: 等非标准协议导致 WebSocket 构造失败
-      const isSecure = window.location.protocol === 'https:';
-      const wsProtocol = isSecure ? 'wss:' : 'ws:';
-      const host = window.location.host;
-
-      // 如果无法获取 host（如在 blob 环境下），则无法建立信令
-      if (!host || window.location.protocol === 'blob:') {
-        console.warn("WebSocket signaling skipped: Host not available or using Blob URL. Signaling server is required for P2P.");
-        setWsStatus('closed');
-        return;
-      }
-
-      const wsUrl = `${wsProtocol}//${host}/ws`;
-      try {
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          setWsStatus('open');
-          ws.send(JSON.stringify({ type: 'join', roomId: config.roomId, name: config.userName }));
-        };
-        ws.onmessage = async (e) => handleSignalingMessage(JSON.parse(e.data));
-        ws.onclose = () => {
-          setWsStatus('closed');
-          // 仅在 host 存在时尝试重连
-          if (window.location.host && window.location.protocol !== 'blob:') {
-            setTimeout(connectSignaling, 3000);
-          }
-        };
-        ws.onerror = (err) => {
-          console.error("WebSocket Error:", err);
-          setWsStatus('closed');
-        };
-      } catch (e) {
-        console.error("Failed to construct WebSocket:", e);
-        setWsStatus('closed');
-      }
-    };
-
     init();
     return () => {
-      wsRef.current?.close();
       peersRef.current.forEach(pc => pc.close());
+      peersRef.current.clear();
+      dataChannelsRef.current.clear();
       localStreamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, [config.roomId, config.userName, config.passphrase, addParticipant]);
 
-  const handleSignalingMessage = async (msg: any) => {
-    const { type, from, offer, answer, candidate, userId, name } = msg;
-
-    switch (type) {
-      case 'user-joined':
-        setupPeerConnection(userId, name, true);
-        break;
-      
-      case 'offer':
-        await setupPeerConnection(from, "Peer", false);
-        const pc = peersRef.current.get(from);
-        if (pc) {
-          await pc.setRemoteDescription(new RTCSessionDescription(offer));
-          const ans = await pc.createAnswer();
-          await pc.setLocalDescription(ans);
-          wsRef.current?.send(JSON.stringify({ type: 'answer', to: from, answer: ans }));
-        }
-        break;
-
-      case 'answer':
-        await peersRef.current.get(from)?.setRemoteDescription(new RTCSessionDescription(answer));
-        break;
-
-      case 'ice-candidate':
-        if (candidate) {
-          await peersRef.current.get(from)?.addIceCandidate(new RTCIceCandidate(candidate));
-        }
-        break;
-
-      case 'user-left':
-        removeParticipant(userId);
-        break;
-    }
-  };
-
-  const setupPeerConnection = async (remoteId: string, remoteName: string, isOffer: boolean) => {
-    if (peersRef.current.has(remoteId)) return;
-
+  const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
     const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
     });
 
     peersRef.current.set(remoteId, pc);
-
     localStreamRef.current?.getTracks().forEach(track => {
-      pc.addTrack(track, localStreamRef.current!);
+      if (localStreamRef.current) pc.addTrack(track, localStreamRef.current);
     });
 
     pc.ontrack = (e) => {
-      addParticipant({ id: remoteId, name: remoteName, isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] });
-    };
-
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        wsRef.current?.send(JSON.stringify({ type: 'ice-candidate', to: remoteId, candidate: e.candidate }));
-      }
+      addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] });
+      setConnectionStatus('connected');
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        removeParticipant(remoteId);
-      }
+        if (pc.connectionState === 'connected') setConnectionStatus('connected');
+        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+            removeParticipant(remoteId);
+            setConnectionStatus('idle');
+            setRole('none');
+            setLocalSDP('');
+            setRemoteSDPInput('');
+        }
     };
 
     if (isOffer) {
       const dc = pc.createDataChannel('secure-transfer', { ordered: true });
       setupDataChannel(remoteId, dc);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      wsRef.current?.send(JSON.stringify({ type: 'offer', to: remoteId, offer }));
     } else {
       pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel);
     }
+
+    return pc;
   };
 
   const setupDataChannel = (remoteId: string, dc: RTCDataChannel) => {
     dataChannelsRef.current.set(remoteId, dc);
     dc.onmessage = async (e) => {
       if (typeof e.data === 'string') {
-        const payload = JSON.parse(e.data);
-        if (payload.type === 'chat') {
-          const text = await decryptMessage(encryptionKeyRef.current!, payload.data, payload.iv);
-          setMessages(prev => [...prev, { id: Date.now().toString(), senderId: remoteId, senderName: 'Peer', text, timestamp: Date.now() }]);
-        } else if (payload.type === 'file-meta') handleFileMetaReceive(payload);
+        try {
+          const payload = JSON.parse(e.data);
+          if (payload.type === 'chat' && encryptionKeyRef.current) {
+            const text = await decryptMessage(encryptionKeyRef.current, payload.data, payload.iv);
+            setMessages(prev => [...prev, { id: Date.now().toString(), senderId: remoteId, senderName: 'Peer', text, timestamp: Date.now() }]);
+          } else if (payload.type === 'file-meta') handleFileMetaReceive(payload);
+        } catch (err) { console.error("DC message error:", err); }
       } else handleFileChunkReceive(e.data);
     };
   };
 
-  const sendMessage = async (text: string) => {
-    const encrypted = await encryptMessage(encryptionKeyRef.current!, text);
-    const payload = JSON.stringify({ type: 'chat', ...encrypted });
-    
-    let sent = false;
-    dataChannelsRef.current.forEach(dc => {
-      if (dc.readyState === 'open') {
-        dc.send(payload);
-        sent = true;
-      }
-    });
+  // ---------------- 发起方业务流 ----------------
+  const startAsInitiator = async () => {
+    setRole('initiator');
+    setConnectionStatus('preparing');
+    const pc = await setupPeerConnection('peer', true);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
 
-    if (sent) {
-      setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, timestamp: Date.now() }]);
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === 'complete') {
+        setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
+        setConnectionStatus('ready');
+      }
+    };
+    // 兼容部分浏览器不触发事件的情况
+    if (pc.iceGatheringState === 'complete') {
+        setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
+        setConnectionStatus('ready');
     }
   };
 
+  const finalizeAsInitiator = async () => {
+    if (!remoteSDPInput) return;
+    try {
+      const decoded = JSON.parse(atob(remoteSDPInput));
+      const pc = peersRef.current.get('peer');
+      if (pc && decoded.type === 'answer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(decoded));
+      } else {
+        alert("无效的回应包 (Answer)，请确认角色是否匹配。");
+      }
+    } catch (e) {
+      alert("包解析失败，请确保代码复制完整。");
+    }
+  };
+
+  // ---------------- 接收方业务流 ----------------
+  const processOfferAndAnswer = async () => {
+    if (!remoteSDPInput) return;
+    try {
+      const decoded = JSON.parse(atob(remoteSDPInput));
+      if (decoded.type !== 'offer') {
+        alert("无效的握手包 (Offer)，接收方必须粘贴发起方的代码。");
+        return;
+      }
+      setRole('receiver');
+      setConnectionStatus('preparing');
+      const pc = await setupPeerConnection('peer', false);
+      await pc.setRemoteDescription(new RTCSessionDescription(decoded));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') {
+          setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
+          setConnectionStatus('ready');
+        }
+      };
+      if (pc.iceGatheringState === 'complete') {
+        setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
+        setConnectionStatus('ready');
+      }
+    } catch (e) {
+      alert("解析失败，请确认复制了完整的 Offer 代码。");
+    }
+  };
+
+  const sendMessage = async (text: string) => {
+    if (!encryptionKeyRef.current) return;
+    const encrypted = await encryptMessage(encryptionKeyRef.current, text);
+    const payload = JSON.stringify({ type: 'chat', ...encrypted });
+    let sent = false;
+    dataChannelsRef.current.forEach(dc => {
+      if (dc && dc.readyState === 'open') { dc.send(payload); sent = true; }
+    });
+    if (sent) setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, timestamp: Date.now() }]);
+  };
+
   const handleFileUpload = async (file: File) => {
+    if (!encryptionKeyRef.current) return;
     const fileId = Math.random().toString(36).substring(7);
     setFiles(prev => [{ id: fileId, name: file.name, size: file.size, progress: 0, status: 'transferring' }, ...prev]);
-    
     const meta = JSON.stringify({ type: 'file-meta', id: fileId, name: file.name, size: file.size });
-    dataChannelsRef.current.forEach(dc => dc.readyState === 'open' && dc.send(meta));
-
+    dataChannelsRef.current.forEach(dc => { if (dc && dc.readyState === 'open') dc.send(meta); });
     const reader = file.stream().getReader();
     let offset = 0;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      
-      const { data, iv } = await encryptBuffer(encryptionKeyRef.current!, value.buffer);
+      const { data, iv } = await encryptBuffer(encryptionKeyRef.current, value.buffer);
       const packet = new Uint8Array(iv.length + data.byteLength);
       packet.set(iv, 0); packet.set(new Uint8Array(data), iv.length);
-      
-      dataChannelsRef.current.forEach(dc => {
-        if (dc.readyState === 'open') dc.send(packet);
-      });
-
+      dataChannelsRef.current.forEach(dc => { if (dc && dc.readyState === 'open') dc.send(packet); });
       offset += value.byteLength;
       setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.round((offset / file.size) * 100) } : f));
     }
@@ -251,84 +230,227 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   };
 
   const handleFileChunkReceive = async (data: ArrayBuffer) => {
-    const state = receivingFileRef.current; if (!state) return;
-    const iv = new Uint8Array(data.slice(0, 12));
-    const encryptedData = data.slice(12);
-    const decryptedChunk = await decryptBuffer(encryptionKeyRef.current!, encryptedData, iv);
-    state.chunks.push(decryptedChunk); state.received += decryptedChunk.byteLength;
-    const progress = Math.round((state.received / state.size) * 100);
-    setFiles(prev => prev.map(f => f.id === state.id ? { ...f, progress } : f));
-    if (state.received >= state.size) {
-      const url = URL.createObjectURL(new Blob(state.chunks));
-      const a = document.createElement('a'); a.href = url; a.download = state.name; a.click();
-      setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
-      receivingFileRef.current = null;
-    }
-  };
-
-  const toggleMute = () => {
-    const track = localStreamRef.current?.getAudioTracks()[0];
-    if (track) { track.enabled = !track.enabled; setIsMuted(!track.enabled); }
-  };
-
-  const toggleVideo = () => {
-    const track = localStreamRef.current?.getVideoTracks()[0];
-    if (track) { track.enabled = !track.enabled; setIsVideoOff(!track.enabled); }
+    const state = receivingFileRef.current; if (!state || !encryptionKeyRef.current) return;
+    try {
+      const iv = new Uint8Array(data.slice(0, 12));
+      const encryptedData = data.slice(12);
+      const decryptedChunk = await decryptBuffer(encryptionKeyRef.current, encryptedData, iv);
+      state.chunks.push(decryptedChunk); state.received += decryptedChunk.byteLength;
+      const progress = Math.round((state.received / state.size) * 100);
+      setFiles(prev => prev.map(f => f.id === state.id ? { ...f, progress } : f));
+      if (state.received >= state.size) {
+        const url = URL.createObjectURL(new Blob(state.chunks));
+        const a = document.createElement('a'); a.href = url; a.download = state.name; a.click();
+        setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
+        receivingFileRef.current = null;
+      }
+    } catch (e) { console.error("Decryption error:", e); }
   };
 
   return (
     <div className="flex flex-col h-[100dvh] bg-background overflow-hidden relative">
-      <div className="absolute top-0 left-1/4 size-[500px] bg-primary/5 blur-[120px] rounded-full pointer-events-none"></div>
-
-      <header className="h-12 lg:h-14 shrink-0 flex items-center justify-between px-4 lg:px-6 glass z-[60] border-b-0 m-2 rounded-xl lg:rounded-2xl">
-        <div className="flex items-center gap-3 lg:gap-4 overflow-hidden">
-          <div className="size-7 lg:size-8 bg-primary/10 rounded-lg flex items-center justify-center border border-primary/20 shrink-0">
-            <span className="material-symbols-outlined text-primary text-sm lg:text-lg fill-1">verified_user</span>
+      <header className="h-12 lg:h-14 shrink-0 flex items-center justify-between px-4 lg:px-6 glass z-[60] m-2 rounded-xl lg:rounded-2xl border-none">
+        <div className="flex items-center gap-3">
+          <div className="size-8 bg-primary/10 rounded-lg flex items-center justify-center border border-primary/20">
+            <span className="material-symbols-outlined text-primary text-sm fill-1">verified_user</span>
           </div>
-          <div className="overflow-hidden">
-            <h2 className="text-[9px] lg:text-[10px] font-black tracking-[0.2em] text-gray-500 uppercase truncate">ID: {config.roomId}</h2>
+          <div className="hidden xs:block">
+            <h2 className="text-[10px] font-black tracking-widest text-gray-500 uppercase">SERVERLESS P2P TERMINAL</h2>
             <div className="flex items-center gap-1.5">
-               <span className={`size-1 rounded-full ${wsStatus === 'open' ? 'bg-accent animate-pulse' : 'bg-red-500 animate-ping'}`}></span>
-               <span className="text-[8px] lg:text-[9px] font-bold text-accent uppercase tracking-widest whitespace-nowrap">
-                 {wsStatus === 'open' ? 'Encrypted Channel' : 'Signaling Offline'}
-               </span>
+               <span className={`size-1.5 rounded-full ${connectionStatus === 'connected' ? 'bg-accent shadow-[0_0_8px_#22c55e]' : 'bg-yellow-500 animate-pulse'}`}></span>
+               <span className="text-[9px] font-bold text-white uppercase tracking-wider">{connectionStatus.toUpperCase()}</span>
             </div>
           </div>
         </div>
-        
-        <div className="flex items-center gap-2">
-            <button onClick={() => { navigator.clipboard.writeText(config.roomId); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000); }} 
-                    className="h-7 lg:h-8 px-2 lg:px-3 rounded-lg bg-white/5 hover:bg-white/10 transition-all border border-white/5 text-[9px] lg:text-[10px] font-bold uppercase tracking-widest flex items-center gap-2">
-                <span className="material-symbols-outlined text-xs lg:text-sm">{isCopied ? 'check' : 'share'}</span>
-                <span className="hidden sm:inline">{isCopied ? '已复制 ID' : '邀请加入'}</span>
-            </button>
-        </div>
+        <button onClick={onExit} className="h-8 px-4 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 text-[10px] font-black uppercase tracking-widest transition-all">物理断开</button>
       </header>
 
-      <main className="flex-1 flex overflow-hidden relative p-2 pt-0 pb-28 lg:pb-2">
-        <div className="flex-1 overflow-y-auto custom-scrollbar p-2">
-          {participants.length < 2 ? (
-            <div className="h-full flex flex-col items-center justify-center text-center space-y-6 lg:space-y-8 animate-in fade-in zoom-in duration-700">
-                <div className="relative">
-                    <div className="absolute inset-0 bg-primary/20 blur-3xl rounded-full scale-150"></div>
-                    <div className="size-24 lg:size-32 rounded-full glass flex items-center justify-center relative border-primary/20 border-2">
-                        <span className="material-symbols-outlined text-4xl lg:text-5xl text-primary animate-float">sensors</span>
+      <main className="flex-1 flex overflow-hidden relative p-2 pt-0">
+        <div className="flex-1 flex flex-col relative overflow-hidden">
+          {connectionStatus !== 'connected' ? (
+            <div className="flex-1 flex flex-col items-center justify-center p-4 lg:p-12 space-y-8 lg:space-y-12 animate-in fade-in duration-700 overflow-y-auto custom-scrollbar">
+                
+                {role === 'none' ? (
+                    <div className="text-center space-y-12 max-w-2xl animate-in zoom-in-95">
+                        <div className="space-y-4">
+                            <h3 className="text-3xl lg:text-5xl font-black text-white tracking-tighter uppercase leading-tight">初始化安全链路</h3>
+                            <p className="text-gray-500 text-sm font-medium leading-relaxed max-w-lg mx-auto">
+                              应用当前运行在 <span className="text-primary font-bold">100% 物理隔离</span> 模式。请选择您的会话角色以开始手动握手交换。
+                            </p>
+                        </div>
+                        
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-3xl">
+                            <button 
+                                onClick={startAsInitiator}
+                                className="group relative flex flex-col items-center justify-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-primary/10 hover:border-primary/40 hover:bg-primary/5 transition-all active:scale-95 shadow-xl"
+                            >
+                                <div className="size-20 rounded-3xl bg-primary/10 flex items-center justify-center text-primary group-hover:scale-110 transition-transform">
+                                    <span className="material-symbols-outlined text-5xl">outbound</span>
+                                </div>
+                                <div className="text-center">
+                                    <h4 className="text-xl font-black text-white uppercase tracking-widest mb-2">我是发起方</h4>
+                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">INITIATOR / 创建 Offer</p>
+                                </div>
+                            </button>
+
+                            <button 
+                                onClick={() => setRole('receiver')}
+                                className="group relative flex flex-col items-center justify-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-accent/10 hover:border-accent/40 hover:bg-accent/5 transition-all active:scale-95 shadow-xl"
+                            >
+                                <div className="size-20 rounded-3xl bg-accent/10 flex items-center justify-center text-accent group-hover:scale-110 transition-transform">
+                                    <span className="material-symbols-outlined text-5xl">call_received</span>
+                                </div>
+                                <div className="text-center">
+                                    <h4 className="text-xl font-black text-white uppercase tracking-widest mb-2">我是接收方</h4>
+                                    <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">RECEIVER / 等待 Offer</p>
+                                </div>
+                            </button>
+                        </div>
                     </div>
-                </div>
-                <div className="space-y-3 px-6">
-                    <h3 className="text-xl lg:text-2xl font-black tracking-tight text-white">等待对端加密节点...</h3>
-                    <p className="text-gray-500 text-xs lg:text-sm max-w-xs mx-auto font-medium leading-relaxed">
-                      信令服务器已连接。请确保对方输入了相同的房间 ID 和口令。
-                    </p>
-                    {wsStatus !== 'open' && (
-                      <p className="text-red-400 text-[10px] font-black uppercase bg-red-400/10 px-4 py-2 rounded-lg border border-red-400/20">
-                        信令连接异常：请检查 WebSocket 地址
-                      </p>
-                    )}
-                </div>
+                ) : (
+                    <div className="w-full max-w-4xl animate-in slide-in-from-bottom-10 duration-500">
+                        {/* 握手终端界面 */}
+                        <div className={`glass rounded-[3rem] p-8 lg:p-12 shadow-3xl bg-black/40 relative overflow-hidden flex flex-col gap-10 border-t-4 transition-all ${role === 'initiator' ? 'border-t-primary' : 'border-t-accent'}`}>
+                            
+                            <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+                                <div className="flex items-center gap-4">
+                                    <button onClick={() => {setRole('none'); setLocalSDP(''); setRemoteSDPInput('');}} className="size-10 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center transition-all">
+                                        <span className="material-symbols-outlined text-gray-400">arrow_back</span>
+                                    </button>
+                                    <div>
+                                        <h3 className="text-2xl font-black text-white tracking-tight uppercase">
+                                            {role === 'initiator' ? '发起方握手终端' : '接收方握手终端'}
+                                        </h3>
+                                        <p className="text-[9px] font-black text-gray-500 uppercase tracking-[0.3em]">
+                                            {role === 'initiator' ? 'OFFER GENERATION & CALLBACK' : 'INBOUND HANDSHAKE AWAIT'}
+                                        </p>
+                                    </div>
+                                </div>
+                                <div className="px-4 py-1.5 bg-white/5 border border-white/10 rounded-full flex items-center gap-2">
+                                    <span className="size-2 rounded-full bg-yellow-500 animate-pulse"></span>
+                                    <span className="text-[9px] font-black text-gray-400 uppercase tracking-widest">等待链路同步</span>
+                                </div>
+                            </div>
+
+                            {/* 交互步骤区域 */}
+                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-12">
+                                
+                                {/* 步骤 01 */}
+                                <div className="flex flex-col gap-6">
+                                    <div className="flex items-center gap-3">
+                                        <span className={`size-8 rounded-2xl flex items-center justify-center text-[11px] font-black border transition-colors ${role === 'initiator' ? 'bg-primary/20 text-primary border-primary/30' : 'bg-white/5 text-gray-500 border-white/10'}`}>01</span>
+                                        <h4 className="text-xs font-black uppercase text-white tracking-widest">
+                                            {role === 'initiator' ? '复制并发送您的代码' : '粘贴对方的代码'}
+                                        </h4>
+                                    </div>
+
+                                    {role === 'initiator' ? (
+                                        <div className="flex-1 flex flex-col gap-3">
+                                            <div className="relative group flex-1 min-h-[160px]">
+                                                <textarea 
+                                                    readOnly 
+                                                    value={localSDP || '计算加密特征中...'} 
+                                                    className="w-full h-full bg-black/60 border border-primary/20 rounded-2xl p-4 text-[9px] font-mono text-primary outline-none resize-none custom-scrollbar" 
+                                                />
+                                                <div className="absolute top-2 right-2 px-2 py-0.5 bg-primary/20 border border-primary/30 rounded text-[8px] font-black text-primary uppercase">Offer Package</div>
+                                            </div>
+                                            <button 
+                                                onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}}
+                                                className="w-full h-12 bg-primary text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 transition-all shadow-lg shadow-primary/20"
+                                            >
+                                                <span className="material-symbols-outlined text-sm">{isCopied ? 'check' : 'content_copy'}</span>
+                                                {isCopied ? '代码已复制' : '复制 Offer 包'}
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <div className="flex-1 flex flex-col gap-3">
+                                            <textarea 
+                                                placeholder="在此粘贴发起方生成的代码 (Offer)..."
+                                                value={remoteSDPInput}
+                                                onChange={(e) => setRemoteSDPInput(e.target.value)}
+                                                className="flex-1 min-h-[160px] bg-black/60 border border-white/10 rounded-2xl p-4 text-[9px] font-mono text-accent outline-none focus:border-accent/40 resize-none transition-all placeholder:text-gray-700"
+                                            />
+                                            <button 
+                                                onClick={processOfferAndAnswer}
+                                                disabled={!remoteSDPInput || connectionStatus === 'preparing'}
+                                                className="w-full h-12 bg-white/5 border border-white/10 hover:bg-white/10 text-white rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 disabled:opacity-20 transition-all"
+                                            >
+                                                <span className="material-symbols-outlined text-sm text-accent">bolt</span>
+                                                解析并生成回应
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* 步骤 02 */}
+                                <div className="flex flex-col gap-6">
+                                    <div className="flex items-center gap-3">
+                                        <span className={`size-8 rounded-2xl flex items-center justify-center text-[11px] font-black border transition-colors ${role === 'receiver' || (role === 'initiator' && remoteSDPInput) ? 'bg-accent/20 text-accent border-accent/30' : 'bg-white/5 text-gray-500 border-white/10'}`}>02</span>
+                                        <h4 className="text-xs font-black uppercase text-white tracking-widest">
+                                            {role === 'initiator' ? '粘贴回应并完成连接' : '复制并回传回应代码'}
+                                        </h4>
+                                    </div>
+
+                                    {role === 'initiator' ? (
+                                        <div className="flex-1 flex flex-col gap-3">
+                                            <textarea 
+                                                placeholder="粘贴接收方发回的代码 (Answer)..."
+                                                value={remoteSDPInput}
+                                                onChange={(e) => setRemoteSDPInput(e.target.value)}
+                                                className="flex-1 min-h-[160px] bg-black/60 border border-white/10 rounded-2xl p-4 text-[9px] font-mono text-accent outline-none focus:border-accent/40 resize-none transition-all"
+                                            />
+                                            <button 
+                                                onClick={finalizeAsInitiator}
+                                                disabled={!remoteSDPInput}
+                                                className="w-full h-12 bg-accent text-black rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 disabled:opacity-20 transition-all shadow-lg shadow-accent/20"
+                                            >
+                                                <span className="material-symbols-outlined text-sm">handshake</span>
+                                                建立隧道链路
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <div className="flex-1 flex flex-col gap-3">
+                                            <div className="relative group flex-1 min-h-[160px]">
+                                                <textarea 
+                                                    readOnly 
+                                                    value={localSDP || '等待步骤 01 完成...'} 
+                                                    className="w-full h-full bg-black/60 border border-accent/20 rounded-2xl p-4 text-[9px] font-mono text-accent outline-none resize-none custom-scrollbar" 
+                                                />
+                                                <div className="absolute top-2 right-2 px-2 py-0.5 bg-accent/20 border border-accent/30 rounded text-[8px] font-black text-accent uppercase">Answer Package</div>
+                                            </div>
+                                            <button 
+                                                onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}}
+                                                disabled={!localSDP}
+                                                className="w-full h-12 bg-accent text-black rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2 active:scale-95 transition-all disabled:opacity-20 shadow-lg shadow-accent/20"
+                                            >
+                                                <span className="material-symbols-outlined text-sm">{isCopied ? 'check' : 'content_copy'}</span>
+                                                {isCopied ? '代码已复制' : '复制回传代码'}
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                            
+                            <div className="pt-8 border-t border-white/5 opacity-50 flex flex-col md:flex-row items-center justify-between gap-4">
+                                <div className="flex items-center gap-6">
+                                    <div className="space-y-0.5">
+                                        <p className="text-[7px] font-black text-white uppercase tracking-widest">安全特征</p>
+                                        <p className="text-[8px] font-mono text-gray-500 uppercase tracking-tighter">P2P-HANDSHAKE-DIRECT-LINK</p>
+                                    </div>
+                                    <div className="h-6 w-px bg-white/10 hidden md:block"></div>
+                                    <div className="space-y-0.5">
+                                        <p className="text-[7px] font-black text-white uppercase tracking-widest">会话 ID</p>
+                                        <p className="text-[8px] font-mono text-gray-500 truncate max-w-[120px]">{config.roomId}</p>
+                                    </div>
+                                </div>
+                                <p className="text-[8px] font-bold text-gray-600 uppercase tracking-[0.3em]">物理隔离协商协议 v1.2</p>
+                            </div>
+                        </div>
+                    </div>
+                )}
             </div>
           ) : (
-            <div className={`grid gap-3 lg:gap-4 h-full content-start justify-center ${participants.length === 1 ? 'grid-cols-1' : participants.length === 2 ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-2 lg:grid-cols-3'}`}>
+            <div className="flex-1 p-2 grid gap-4 h-full content-start justify-center md:grid-cols-2 lg:grid-cols-2">
               {participants.map(p => (
                 <VideoCard key={p.id} participant={p} filter={p.isLocal ? currentFilter : PrivacyFilter.NONE} />
               ))}
@@ -336,58 +458,50 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           )}
         </div>
 
-        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-96 glass lg:bg-transparent lg:backdrop-blur-none lg:border-l-0 transform transition-all duration-300 ease-in-out z-[110] flex flex-col lg:m-2 lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 scale-95 pointer-events-none'}`}>
-             <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/40 lg:bg-white/2px shrink-0">
-                <h3 className="text-[10px] font-black uppercase tracking-widest text-gray-500">
-                    E2EE 安全会话通道
-                </h3>
-                <button onClick={() => setIsChatOpen(false)} className="size-8 rounded-full hover:bg-white/5 flex items-center justify-center transition-colors">
-                    <span className="material-symbols-outlined text-lg">close</span>
+        {/* 侧边聊天面板 */}
+        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-96 glass transform transition-all duration-300 z-[110] flex flex-col lg:m-2 lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100 shadow-[0_0_100px_rgba(0,0,0,0.8)]' : 'translate-y-full lg:hidden opacity-0 scale-95 pointer-events-none'}`}>
+             <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/40 shrink-0">
+                <div className="flex items-center gap-2">
+                    <span className="size-2 rounded-full bg-accent"></span>
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-gray-400">E2EE 数据隧道</h3>
+                </div>
+                <button onClick={() => setIsChatOpen(false)} className="size-8 rounded-full hover:bg-white/10 flex items-center justify-center transition-colors">
+                    <span className="material-symbols-outlined text-lg text-gray-500">close</span>
                 </button>
              </div>
-             <div className="flex-1 overflow-hidden bg-background lg:bg-transparent flex flex-col">
-                <ChatBox 
-                    messages={messages} 
-                    onSend={sendMessage} 
-                    userName={config.userName} 
-                    files={files} 
-                    onUpload={handleFileUpload} 
-                />
+             <div className="flex-1 overflow-hidden bg-background flex flex-col">
+                <ChatBox messages={messages} onSend={sendMessage} userName={config.userName} files={files} onUpload={handleFileUpload} />
              </div>
         </div>
       </main>
 
-      <div className={`fixed bottom-[calc(1rem+env(safe-area-inset-bottom))] lg:bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-2 lg:gap-3 p-2 lg:p-3 glass rounded-3xl lg:rounded-[2rem] z-[100] shadow-2xl shadow-black transition-all ${isChatOpen ? 'translate-y-24 opacity-0 scale-90 pointer-events-none' : 'translate-y-0 opacity-100'}`}>
-        <div className="flex items-center gap-1 bg-white/5 p-1 rounded-2xl mr-1 lg:mr-2">
-            <FilterBtn active={currentFilter === PrivacyFilter.NONE} icon="visibility" onClick={() => setCurrentFilter(PrivacyFilter.NONE)} />
-            <FilterBtn active={currentFilter === PrivacyFilter.MOSAIC} icon="grid_view" onClick={() => setCurrentFilter(PrivacyFilter.MOSAIC)} />
-            <FilterBtn active={currentFilter === PrivacyFilter.BLACK} icon="videocam_off" onClick={() => setCurrentFilter(PrivacyFilter.BLACK)} />
+      {/* 底部控制栏 */}
+      {connectionStatus === 'connected' && (
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 p-3 glass rounded-[2rem] z-[100] shadow-2xl shadow-black animate-in slide-in-from-bottom-10">
+          <div className="flex items-center gap-1 bg-white/5 p-1 rounded-2xl mr-2">
+              <FilterBtn active={currentFilter === PrivacyFilter.NONE} icon="visibility" onClick={() => setCurrentFilter(PrivacyFilter.NONE)} />
+              <FilterBtn active={currentFilter === PrivacyFilter.MOSAIC} icon="grid_view" onClick={() => setCurrentFilter(PrivacyFilter.MOSAIC)} />
+              <FilterBtn active={currentFilter === PrivacyFilter.BLACK} icon="videocam_off" onClick={() => setCurrentFilter(PrivacyFilter.BLACK)} />
+          </div>
+          <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={() => { const t = localStreamRef.current?.getAudioTracks()[0]; if (t) { t.enabled = !t.enabled; setIsMuted(!t.enabled); } }} danger={isMuted} />
+          <ControlBtn icon={isVideoOff ? 'videocam_off' : 'videocam'} active={!isVideoOff} onClick={() => { const t = localStreamRef.current?.getVideoTracks()[0]; if (t) { t.enabled = !t.enabled; setIsVideoOff(!t.enabled); } }} danger={isVideoOff} />
+          <div className="w-px h-6 bg-white/10 mx-1"></div>
+          <ControlBtn icon="forum" active={isChatOpen} onClick={() => setIsChatOpen(true)} />
         </div>
-
-        <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={toggleMute} danger={isMuted} />
-        <ControlBtn icon={isVideoOff ? 'videocam_off' : 'videocam'} active={!isVideoOff} onClick={toggleVideo} danger={isVideoOff} />
-        
-        <div className="w-px h-6 bg-white/10 mx-1"></div>
-        <ControlBtn icon="forum" active={isChatOpen} onClick={() => setIsChatOpen(true)} />
-        <div className="w-px h-6 bg-white/10 mx-1"></div>
-
-        <button onClick={onExit} className="size-10 lg:size-12 rounded-full bg-red-500 hover:bg-red-400 text-white flex items-center justify-center transition-all active:scale-90 shadow-lg shadow-red-500/20">
-            <span className="material-symbols-outlined fill-1 text-sm lg:text-base">call_end</span>
-        </button>
-      </div>
+      )}
     </div>
   );
 };
 
 const FilterBtn = ({ active, icon, onClick }: { active: boolean; icon: string; onClick: () => void }) => (
-  <button onClick={onClick} className={`size-7 lg:size-8 rounded-lg flex items-center justify-center transition-all ${active ? 'bg-primary text-white shadow-lg shadow-primary/20' : 'text-gray-500 hover:text-white hover:bg-white/5'}`}>
-    <span className="material-symbols-outlined text-sm lg:text-[18px]">{icon}</span>
+  <button onClick={onClick} className={`size-8 rounded-lg flex items-center justify-center transition-all ${active ? 'bg-primary text-white shadow-lg shadow-primary/30' : 'text-gray-500 hover:text-white hover:bg-white/10'}`}>
+    <span className="material-symbols-outlined text-[18px]">{icon}</span>
   </button>
 );
 
 const ControlBtn = ({ icon, active, onClick, danger }: { icon: string; active: boolean; onClick: () => void; danger?: boolean }) => (
-  <button onClick={onClick} className={`size-10 lg:size-12 rounded-full flex items-center justify-center transition-all border ${active ? 'bg-white/5 border-white/10 text-white' : (danger ? 'bg-red-500/10 border-red-500/20 text-red-500' : 'bg-white/5 border-white/5 text-gray-500')} hover:scale-105 active:scale-90`}>
-    <span className="material-symbols-outlined text-sm lg:text-[20px]">{icon}</span>
+  <button onClick={onClick} className={`size-12 rounded-full flex items-center justify-center transition-all border ${active ? 'bg-white/5 border-white/10 text-white' : (danger ? 'bg-red-500/20 border-red-500/20 text-red-500' : 'bg-white/5 border-white/5 text-gray-500')} hover:scale-105 active:scale-90`}>
+    <span className="material-symbols-outlined text-[20px]">{icon}</span>
   </button>
 );
 
@@ -395,26 +509,18 @@ const ChatBox = ({ messages, onSend, userName, files, onUpload }: { messages: Ch
   const [text, setText] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, files]);
-
   return (
-    <div className="flex flex-col h-full bg-background lg:bg-transparent">
+    <div className="flex flex-col h-full">
       {files.length > 0 && (
         <div className="shrink-0 max-h-48 overflow-y-auto p-4 border-b border-white/5 bg-white/[0.02] custom-scrollbar">
-            <div className="flex items-center justify-between mb-3 px-1">
-                <span className="text-[9px] font-black uppercase tracking-widest text-primary">传输链路活跃</span>
-                <span className="text-[8px] font-bold text-gray-600 uppercase">{files.length} 对象</span>
-            </div>
             <div className="space-y-2">
                 {files.map(f => (
-                    <div key={f.id} className="p-2.5 rounded-xl bg-black/40 border border-white/5 flex flex-col gap-2">
+                    <div key={f.id} className="p-3 rounded-2xl bg-black/40 border border-white/5 flex flex-col gap-2">
                         <div className="flex justify-between items-center">
-                            <div className="flex items-center gap-2 overflow-hidden">
-                                <span className="material-symbols-outlined text-sm text-gray-500">attach_file</span>
-                                <p className="text-[10px] font-bold truncate text-gray-300">{f.name}</p>
-                            </div>
-                            <span className="text-[8px] font-black text-primary uppercase shrink-0">{f.status === 'completed' ? '成功' : `${f.progress}%`}</span>
+                            <p className="text-[10px] font-black truncate text-gray-300 uppercase tracking-tight">{f.name}</p>
+                            <span className="text-[8px] font-black text-primary uppercase">{f.status === 'completed' ? '成功' : `${f.progress}%`}</span>
                         </div>
-                        <div className="h-0.5 w-full bg-white/5 rounded-full overflow-hidden">
+                        <div className="h-1 w-full bg-white/5 rounded-full overflow-hidden">
                             <div className="h-full bg-primary transition-all duration-300" style={{ width: `${f.progress}%` }}></div>
                         </div>
                     </div>
@@ -422,40 +528,24 @@ const ChatBox = ({ messages, onSend, userName, files, onUpload }: { messages: Ch
             </div>
         </div>
       )}
-
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 lg:space-y-6 custom-scrollbar">
-        {messages.length === 0 && files.length === 0 && (
-            <div className="h-full flex flex-col items-center justify-center opacity-10 text-center py-20">
-                <span className="material-symbols-outlined text-6xl mb-4">encrypted</span>
-                <p className="text-[10px] font-black uppercase tracking-[0.3em]">端到端加密已就绪</p>
-            </div>
-        )}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
         {messages.map(m => (
           <div key={m.id} className={`flex flex-col ${m.senderId === 'local' ? 'items-end' : 'items-start'}`}>
-             <div className={`px-4 py-2.5 lg:py-3 rounded-2xl max-w-[85%] text-xs lg:text-sm leading-relaxed ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-white/5 border border-white/10 text-gray-300 rounded-tl-none'}`}>
+             <div className={`px-4 py-2.5 rounded-2xl max-w-[85%] text-xs leading-relaxed ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-white/5 border border-white/10 text-gray-300 rounded-tl-none'}`}>
                {m.text}
              </div>
-             <span className="text-[8px] font-bold text-gray-700 mt-1.5 mx-1 uppercase tracking-widest">{new Date(m.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+             <span className="text-[8px] font-bold text-gray-700 mt-2 mx-1 uppercase tracking-widest">{new Date(m.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
           </div>
         ))}
       </div>
-
-      <div className="p-4 bg-black/80 lg:bg-white/2px border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))] lg:pb-4 shrink-0">
+      <div className="p-4 bg-black/80 border-t border-white/5 shrink-0 pb-[calc(1.5rem+env(safe-area-inset-bottom))] lg:pb-4">
         <form onSubmit={(e) => { e.preventDefault(); if (text.trim()) { onSend(text); setText(''); } }} className="relative flex gap-2">
-          <label className="shrink-0 size-11 lg:size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center hover:bg-white/10 hover:text-white transition-all cursor-pointer">
+          <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 transition-colors">
               <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
-              <span className="material-symbols-outlined text-sm lg:text-[20px]">add_circle</span>
+              <span className="material-symbols-outlined">attach_file</span>
           </label>
-          
-          <input 
-            className="flex-1 h-11 lg:h-12 bg-white/5 border border-white/10 rounded-xl px-4 text-xs lg:text-sm focus:border-primary/50 outline-none transition-all placeholder:text-gray-700 text-white" 
-            placeholder="发送加密消息..." 
-            value={text} 
-            onChange={(e) => setText(e.target.value)} 
-          />
-          <button type="submit" className="shrink-0 size-11 lg:size-12 bg-primary text-white rounded-xl flex items-center justify-center hover:bg-blue-600 transition-all active:scale-90 shadow-lg shadow-primary/20">
-            <span className="material-symbols-outlined text-sm lg:text-[18px]">send</span>
-          </button>
+          <input className="flex-1 h-12 bg-white/5 border border-white/10 rounded-xl px-4 text-sm text-white focus:outline-none focus:border-primary/50 transition-all" placeholder="输入加密消息..." value={text} onChange={(e) => setText(e.target.value)} />
+          <button type="submit" disabled={!text.trim()} className="shrink-0 size-12 bg-primary text-white rounded-xl flex items-center justify-center disabled:opacity-30 disabled:grayscale transition-all shadow-lg shadow-primary/20"><span className="material-symbols-outlined">send</span></button>
         </form>
       </div>
     </div>
