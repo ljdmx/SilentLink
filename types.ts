@@ -23,11 +23,16 @@ export interface Participant {
   stream?: MediaStream;
 }
 
+export type MessageType = 'text' | 'image' | 'video' | 'file';
+
 export interface ChatMessage {
   id: string;
   senderId: string;
   senderName: string;
-  text: string;
+  text?: string;
+  blobUrl?: string;
+  fileName?: string;
+  type: MessageType;
   timestamp: number;
 }
 
@@ -37,6 +42,7 @@ export interface FileTransfer {
   size: number;
   progress: number;
   status: 'pending' | 'transferring' | 'completed' | 'failed';
+  mimeType?: string;
 }
 
 export interface RoomConfig {

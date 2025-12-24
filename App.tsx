@@ -4,12 +4,34 @@ import Landing from './components/Landing';
 import Setup from './components/Setup';
 import Room from './components/Room';
 import SystemDesign from './components/SystemDesign';
-import { ViewMode, RoomConfig } from './types';
+import { ViewMode, RoomConfig, PrivacyFilter } from './types';
 
 const App: React.FC = () => {
   const [view, setView] = useState<ViewMode>(ViewMode.LANDING);
   const [roomConfig, setRoomConfig] = useState<RoomConfig | null>(null);
   const [isTabFocused, setIsTabFocused] = useState(true);
+
+  useEffect(() => {
+    // 自动检测魔术链接
+    const hash = window.location.hash;
+    if (hash.includes('offer=')) {
+      const params = new URLSearchParams(hash.substring(1));
+      const roomId = params.get('room') || 'AUTO_ROOM';
+      const passphrase = params.get('pass') || 'AUTO_PASS';
+      
+      const config: RoomConfig = {
+        roomId,
+        passphrase,
+        userName: `访客_${Math.random().toString(36).substring(7)}`,
+        recordingProtection: true,
+        ephemeralSession: true,
+        defaultFilter: PrivacyFilter.NONE,
+      };
+      
+      setRoomConfig(config);
+      setView(ViewMode.ROOM);
+    }
+  }, []);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -27,6 +49,7 @@ const App: React.FC = () => {
   const handleExit = useCallback(() => {
     setRoomConfig(null);
     setView(ViewMode.LANDING);
+    window.location.hash = '';
   }, []);
 
   return (
@@ -63,7 +86,7 @@ const App: React.FC = () => {
             <div className="size-24 rounded-full bg-primary/20 flex items-center justify-center mx-auto mb-6 border border-primary/30 shadow-[0_0_50px_rgba(19,127,236,0.3)]">
                 <span className="material-symbols-outlined text-primary text-5xl animate-pulse">shield_lock</span>
             </div>
-            <h2 className="text-3xl font-black mb-2 tracking-tight">隐私屏蔽已激活</h2>
+            <h2 className="text-3xl font-black mb-2 tracking-tight text-white">隐私屏蔽已激活</h2>
             <p className="text-gray-400 font-medium">检测到窗口失焦，实时画面已自动切断。</p>
             <div className="mt-8 px-6 py-2 bg-primary/10 border border-primary/20 rounded-full inline-flex items-center gap-2">
                 <span className="size-2 rounded-full bg-primary animate-ping"></span>
