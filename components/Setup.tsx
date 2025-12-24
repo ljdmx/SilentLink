@@ -5,7 +5,7 @@ import { RoomConfig, PrivacyFilter, ViewMode } from '../types';
 interface SetupProps {
   onBack: () => void;
   onStart: (config: RoomConfig) => void;
-  onViewDesign?: () => void; // Added for whitepaper navigation
+  onViewDesign?: () => void;
 }
 
 const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
@@ -18,7 +18,7 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
     e.preventDefault();
     if (!userName || !passphrase) return;
     onStart({
-      roomId: roomName || Math.random().toString(36).substring(7).toUpperCase(),
+      roomId: roomName.trim().toUpperCase() || Math.random().toString(36).substring(7).toUpperCase(),
       passphrase,
       userName,
       recordingProtection: true,
@@ -30,7 +30,7 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
   return (
     <div className="min-h-screen bg-[#0a0f14] flex flex-col items-center justify-center p-4 lg:p-6 overflow-y-auto selection:bg-primary/30">
       <div className="w-full max-w-2xl bg-surface/30 border border-white/5 rounded-[2rem] lg:rounded-[3rem] p-6 lg:p-12 shadow-2xl backdrop-blur-3xl my-8 relative overflow-hidden">
-        {/* Subtle background glow */}
+        {/* 背景光效 */}
         <div className="absolute top-0 right-0 size-64 bg-primary/5 blur-[80px] -mr-32 -mt-32"></div>
 
         <button onClick={onBack} className="flex items-center gap-2 text-gray-500 hover:text-white mb-8 transition-colors group text-sm relative z-10">
@@ -38,32 +38,55 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
           <span className="font-bold uppercase tracking-widest">返回主页</span>
         </button>
 
-        <h1 className="text-2xl lg:text-4xl font-black mb-2 tracking-tight text-white relative z-10">安全节点配置</h1>
-        <p className="text-gray-500 mb-8 lg:mb-12 font-medium text-sm lg:text-base relative z-10">配置您的端到端加密环境，密钥将仅存在于您的本地内存。</p>
+        <h1 className="text-2xl lg:text-4xl font-black mb-2 tracking-tight text-white relative z-10">配置安全节点</h1>
+        <p className="text-gray-500 mb-8 lg:mb-12 font-medium text-sm lg:text-base relative z-10">进入房间前，请确保您与对端使用相同的<span className="text-primary">房间 ID</span>和<span className="text-primary">会话口令</span>。</p>
 
-        <form onSubmit={handleSubmit} className="space-y-6 lg:space-y-10 relative z-10">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-8">
+        <form onSubmit={handleSubmit} className="space-y-6 lg:space-y-8 relative z-10">
+          <div className="space-y-6">
+            {/* 房间 ID 输入 - 新增 */}
             <div className="space-y-3">
-              <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1">个人显示名称</label>
+              <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1 flex items-center gap-2">
+                <span className="size-1.5 rounded-full bg-primary"></span>
+                房间 ID (Room ID)
+              </label>
               <input 
-                required
                 autoComplete="off"
-                className="w-full h-14 bg-black/40 border border-white/5 rounded-2xl px-5 focus:ring-2 focus:ring-primary outline-none transition-all placeholder:text-gray-700 text-white"
-                placeholder="例如：匿名用户"
-                value={userName}
-                onChange={(e) => setUserName(e.target.value)}
+                className="w-full h-14 bg-black/40 border border-white/5 rounded-2xl px-5 focus:ring-2 focus:ring-primary outline-none transition-all placeholder:text-gray-700 text-white font-mono uppercase tracking-widest"
+                placeholder="留空则自动生成新房间"
+                value={roomName}
+                onChange={(e) => setRoomName(e.target.value)}
               />
             </div>
-            <div className="space-y-3">
-              <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1">会话密钥口令 (E2EE)</label>
-              <input 
-                required
-                type="password"
-                className="w-full h-14 bg-black/40 border border-white/5 rounded-2xl px-5 focus:ring-2 focus:ring-primary outline-none transition-all placeholder:text-gray-700 text-white"
-                placeholder="建议 12 位以上"
-                value={passphrase}
-                onChange={(e) => setPassphrase(e.target.value)}
-              />
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 lg:gap-8">
+              <div className="space-y-3">
+                <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1 flex items-center gap-2">
+                  <span className="size-1.5 rounded-full bg-gray-600"></span>
+                  个人显示名称
+                </label>
+                <input 
+                  required
+                  autoComplete="off"
+                  className="w-full h-14 bg-black/40 border border-white/5 rounded-2xl px-5 focus:ring-2 focus:ring-primary outline-none transition-all placeholder:text-gray-700 text-white"
+                  placeholder="例如：匿名用户"
+                  value={userName}
+                  onChange={(e) => setUserName(e.target.value)}
+                />
+              </div>
+              <div className="space-y-3">
+                <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1 flex items-center gap-2">
+                  <span className="size-1.5 rounded-full bg-accent"></span>
+                  会话加密口令
+                </label>
+                <input 
+                  required
+                  type="password"
+                  className="w-full h-14 bg-black/40 border border-white/5 rounded-2xl px-5 focus:ring-2 focus:ring-primary outline-none transition-all placeholder:text-gray-700 text-white"
+                  placeholder="双方口令必须完全一致"
+                  value={passphrase}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                />
+              </div>
             </div>
           </div>
 
@@ -93,11 +116,11 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
                   <option value={PrivacyFilter.BLACK}>隐藏 (Hidden)</option>
                 </select>
               </div>
-              <div className="bg-black/20 rounded-2xl p-4 border border-white/5 flex gap-4 items-center opacity-50">
+              <div className="bg-black/20 rounded-2xl p-4 border border-white/5 flex gap-4 items-center opacity-50 select-none">
                 <span className="material-symbols-outlined text-gray-500">lock_reset</span>
                 <div>
                    <h4 className="font-bold text-xs lg:text-sm">自动旋转密钥</h4>
-                   <p className="text-[10px] text-gray-500 mt-1 uppercase">Dynamic Keys Enabled</p>
+                   <p className="text-[10px] text-gray-500 mt-1 uppercase">端到端硬件级加固</p>
                 </div>
               </div>
             </div>
@@ -107,9 +130,9 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
             <button 
                 type="submit" 
                 disabled={!userName || !passphrase}
-                className="w-full h-16 bg-primary rounded-2xl font-black text-base lg:text-lg shadow-xl shadow-primary/20 hover:scale-[1.01] active:scale-95 transition-all disabled:opacity-30 disabled:grayscale disabled:cursor-not-allowed text-white"
+                className="w-full h-16 bg-primary rounded-2xl font-black text-base lg:text-lg shadow-xl shadow-primary/20 hover:scale-[1.01] active:scale-95 transition-all disabled:opacity-30 disabled:grayscale disabled:cursor-not-allowed text-white uppercase tracking-widest"
             >
-              初始化加密会话
+              {roomName ? '加入加密频道' : '初始化新频道'}
             </button>
             
             <div className="flex flex-col items-center gap-6 mt-8">
@@ -125,7 +148,7 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
                 >
                   <span className="material-symbols-outlined text-sm">architecture</span>
                   <span className="text-[10px] font-mono font-bold uppercase tracking-widest border-b border-primary/20 group-hover:border-primary transition-all">
-                    深入了解：端到端加密技术原理
+                    技术原理：如何实现零存储 E2EE？
                   </span>
                 </button>
               )}

@@ -11,7 +11,7 @@ interface RoomProps {
 
 const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [participants, setParticipants] = useState<Participant[]>([]);
-  const [activePanel, setActivePanel] = useState<'chat' | 'file' | null>(null);
+  const [isChatOpen, setIsChatOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [files, setFiles] = useState<FileTransfer[]>([]);
   const [currentFilter, setCurrentFilter] = useState<PrivacyFilter>(config.defaultFilter);
@@ -33,7 +33,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         localStreamRef.current = stream;
         addParticipant({ id: 'local', name: config.userName, isLocal: true, isHost: true, audioEnabled: true, videoEnabled: true, stream });
         
-        // 修复：使用更可靠的协议转换逻辑，防止 HTTPS 下加载 ws:// 导致的安全性错误
         const wsProtocol = window.location.protocol.replace('http', 'ws');
         const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
         const ws = new WebSocket(wsUrl);
@@ -192,7 +191,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         </div>
       </header>
 
-      {/* 视频网格区 - 增加底部内边距，确保不被控制条遮挡 */}
+      {/* 视频网格区 */}
       <main className="flex-1 flex overflow-hidden relative p-2 pt-0 pb-28 lg:pb-2">
         <div className="flex-1 overflow-y-auto custom-scrollbar p-2">
           {participants.length < 2 ? (
@@ -217,26 +216,30 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           )}
         </div>
 
-        {/* 侧边面板 (聊天/文件) - 移动端全屏优化 */}
-        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-80 glass lg:bg-transparent lg:backdrop-blur-none lg:border-l-0 transform transition-all duration-300 ease-in-out z-[110] flex flex-col lg:m-2 lg:rounded-2xl overflow-hidden ${activePanel ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 scale-95 pointer-events-none'}`}>
+        {/* 侧边面板 (聊天与文件合并) */}
+        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-96 glass lg:bg-transparent lg:backdrop-blur-none lg:border-l-0 transform transition-all duration-300 ease-in-out z-[110] flex flex-col lg:m-2 lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 scale-95 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/40 lg:bg-white/2px shrink-0">
                 <h3 className="text-[10px] font-black uppercase tracking-widest text-gray-500">
-                    {activePanel === 'chat' ? '安全加密消息' : '端到端文件传输'}
+                    安全通讯与文件分片
                 </h3>
-                <button onClick={() => setActivePanel(null)} className="size-8 rounded-full hover:bg-white/5 flex items-center justify-center transition-colors">
+                <button onClick={() => setIsChatOpen(false)} className="size-8 rounded-full hover:bg-white/5 flex items-center justify-center transition-colors">
                     <span className="material-symbols-outlined text-lg">close</span>
                 </button>
              </div>
              <div className="flex-1 overflow-hidden bg-background lg:bg-transparent flex flex-col">
-                {activePanel === 'chat' && <ChatBox messages={messages} onSend={sendMessage} userName={config.userName} />}
-                {activePanel === 'file' && <FileExchange files={files} onUpload={handleFileUpload} />}
+                <ChatBox 
+                    messages={messages} 
+                    onSend={sendMessage} 
+                    userName={config.userName} 
+                    files={files} 
+                    onUpload={handleFileUpload} 
+                />
              </div>
         </div>
       </main>
 
-      {/* 浮动控制中心 - 针对安全区域适配 */}
-      <div className={`fixed bottom-[calc(1rem+env(safe-area-inset-bottom))] lg:bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-2 lg:gap-3 p-2 lg:p-3 glass rounded-3xl lg:rounded-[2rem] z-[100] shadow-2xl shadow-black transition-all ${activePanel ? 'translate-y-24 opacity-0 scale-90 pointer-events-none' : 'translate-y-0 opacity-100'}`}>
-        {/* 隐私滤镜组 */}
+      {/* 浮动控制中心 */}
+      <div className={`fixed bottom-[calc(1rem+env(safe-area-inset-bottom))] lg:bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-2 lg:gap-3 p-2 lg:p-3 glass rounded-3xl lg:rounded-[2rem] z-[100] shadow-2xl shadow-black transition-all ${isChatOpen ? 'translate-y-24 opacity-0 scale-90 pointer-events-none' : 'translate-y-0 opacity-100'}`}>
         <div className="flex items-center gap-1 bg-white/5 p-1 rounded-2xl mr-1 lg:mr-2">
             <FilterBtn active={currentFilter === PrivacyFilter.NONE} icon="visibility" onClick={() => setCurrentFilter(PrivacyFilter.NONE)} />
             <FilterBtn active={currentFilter === PrivacyFilter.MOSAIC} icon="grid_view" onClick={() => setCurrentFilter(PrivacyFilter.MOSAIC)} />
@@ -248,8 +251,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         
         <div className="w-px h-6 bg-white/10 mx-1"></div>
         
-        <ControlBtn icon="forum" active={activePanel === 'chat'} onClick={() => setActivePanel('chat')} />
-        <ControlBtn icon="upload_file" active={activePanel === 'file'} onClick={() => setActivePanel('file')} />
+        <ControlBtn icon="forum" active={isChatOpen} onClick={() => setIsChatOpen(true)} />
         
         <div className="w-px h-6 bg-white/10 mx-1"></div>
 
@@ -273,18 +275,44 @@ const ControlBtn = ({ icon, active, onClick, danger }: { icon: string; active: b
   </button>
 );
 
-const ChatBox = ({ messages, onSend, userName }: { messages: ChatMessage[]; onSend: (t: string) => void; userName: string }) => {
+const ChatBox = ({ messages, onSend, userName, files, onUpload }: { messages: ChatMessage[]; onSend: (t: string) => void; userName: string; files: FileTransfer[]; onUpload: (f: File) => void }) => {
   const [text, setText] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages]);
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, files]);
 
   return (
     <div className="flex flex-col h-full bg-background lg:bg-transparent">
+      {/* 文件列表区域 (固定在聊天顶部) */}
+      {files.length > 0 && (
+        <div className="shrink-0 max-h-48 overflow-y-auto p-4 border-b border-white/5 bg-white/[0.02] custom-scrollbar">
+            <div className="flex items-center justify-between mb-3 px-1">
+                <span className="text-[9px] font-black uppercase tracking-widest text-primary">活跃传输节点</span>
+                <span className="text-[8px] font-bold text-gray-600 uppercase">{files.length} 个对象</span>
+            </div>
+            <div className="space-y-2">
+                {files.map(f => (
+                    <div key={f.id} className="p-2.5 rounded-xl bg-black/40 border border-white/5 flex flex-col gap-2">
+                        <div className="flex justify-between items-center">
+                            <div className="flex items-center gap-2 overflow-hidden">
+                                <span className="material-symbols-outlined text-sm text-gray-500">attach_file</span>
+                                <p className="text-[10px] font-bold truncate text-gray-300">{f.name}</p>
+                            </div>
+                            <span className="text-[8px] font-black text-primary uppercase shrink-0">{f.status === 'completed' ? '已完成' : `${f.progress}%`}</span>
+                        </div>
+                        <div className="h-0.5 w-full bg-white/5 rounded-full overflow-hidden">
+                            <div className="h-full bg-primary transition-all duration-300" style={{ width: `${f.progress}%` }}></div>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </div>
+      )}
+
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 lg:space-y-6 custom-scrollbar">
-        {messages.length === 0 && (
+        {messages.length === 0 && files.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center opacity-10 text-center py-20">
                 <span className="material-symbols-outlined text-6xl mb-4">encrypted</span>
-                <p className="text-[10px] font-black uppercase tracking-[0.3em]">Channel Encrypted</p>
+                <p className="text-[10px] font-black uppercase tracking-[0.3em]">端到端加密频道已就绪</p>
             </div>
         )}
         {messages.map(m => (
@@ -296,16 +324,21 @@ const ChatBox = ({ messages, onSend, userName }: { messages: ChatMessage[]; onSe
           </div>
         ))}
       </div>
-      {/* 底部输入框 - 确保其在移动端始终可见，增加安全区内边距 */}
+
       <div className="p-4 bg-black/80 lg:bg-white/2px border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))] lg:pb-4 shrink-0">
         <form onSubmit={(e) => { e.preventDefault(); if (text.trim()) { onSend(text); setText(''); } }} className="relative flex gap-2">
+          {/* 文件上传入口 */}
+          <label className="shrink-0 size-11 lg:size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center hover:bg-white/10 hover:text-white transition-all cursor-pointer">
+              <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
+              <span className="material-symbols-outlined text-sm lg:text-[20px]">add_circle</span>
+          </label>
+          
           <input 
             className="flex-1 h-11 lg:h-12 bg-white/5 border border-white/10 rounded-xl px-4 text-xs lg:text-sm focus:border-primary/50 outline-none transition-all placeholder:text-gray-700 text-white" 
-            placeholder="输入加密消息..." 
+            placeholder="加密消息..." 
             value={text} 
             onChange={(e) => setText(e.target.value)} 
             onFocus={() => {
-                // 解决某些移动端软键盘遮挡问题
                 setTimeout(() => scrollRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }), 300);
             }}
           />
@@ -313,45 +346,6 @@ const ChatBox = ({ messages, onSend, userName }: { messages: ChatMessage[]; onSe
             <span className="material-symbols-outlined text-sm lg:text-[18px]">send</span>
           </button>
         </form>
-      </div>
-    </div>
-  );
-};
-
-const FileExchange = ({ files, onUpload }: { files: FileTransfer[]; onUpload: (f: File) => void }) => {
-  return (
-    <div className="flex flex-col h-full bg-background lg:bg-transparent">
-      <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 custom-scrollbar">
-        {files.length === 0 && (
-           <div className="h-full flex flex-col items-center justify-center text-center opacity-20 py-12">
-              <span className="material-symbols-outlined text-5xl mb-4">cloud_off</span>
-              <p className="text-[10px] font-bold uppercase tracking-widest">暂无传输任务</p>
-           </div>
-        )}
-        {files.map(f => (
-          <div key={f.id} className="p-3 lg:p-4 rounded-xl bg-white/5 border border-white/5 space-y-3">
-             <div className="flex justify-between items-start">
-                <div className="overflow-hidden pr-4">
-                    <p className="text-[11px] lg:text-xs font-bold truncate text-gray-200">{f.name}</p>
-                    <p className="text-[8px] lg:text-[9px] text-gray-600 font-mono mt-1">{(f.size / 1024 / 1024).toFixed(2)} MB</p>
-                </div>
-                <div className="flex items-center gap-1.5 shrink-0">
-                    <span className="size-1 bg-primary rounded-full animate-pulse"></span>
-                    <span className="text-[8px] lg:text-[9px] font-black text-primary uppercase">{f.status === 'completed' ? '完成' : `${f.progress}%`}</span>
-                </div>
-             </div>
-             <div className="h-0.5 w-full bg-white/5 rounded-full overflow-hidden">
-                <div className="h-full bg-primary transition-all duration-300" style={{ width: `${f.progress}%` }}></div>
-             </div>
-          </div>
-        ))}
-      </div>
-      <div className="p-4 bg-black/80 lg:bg-white/2px border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))] lg:pb-4 shrink-0">
-        <label className="flex items-center justify-center w-full h-12 lg:h-14 bg-primary/5 border border-dashed border-primary/20 rounded-xl cursor-pointer hover:bg-primary/10 hover:border-primary/40 transition-all gap-3 text-primary">
-            <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
-            <span className="material-symbols-outlined text-sm lg:text-base">add_circle</span>
-            <span className="text-[10px] lg:text-xs font-bold uppercase tracking-widest">分片传输大文件</span>
-        </label>
       </div>
     </div>
   );
