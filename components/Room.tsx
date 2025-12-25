@@ -21,9 +21,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [isRemoteMuted, setIsRemoteMuted] = useState(false);
   const [isRemoteHidden, setIsRemoteHidden] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
-  const [showLocalPreview, setShowLocalPreview] = useState(true); // 控制本地视频框显示
+  const [showLocalPreview, setShowLocalPreview] = useState(true); // 控制本地预览显隐
   
-  // Derived state for easy access in JSX
+  // 核心状态衍生
   const localParticipant = participants.find(p => p.isLocal);
   const remoteParticipant = participants.find(p => !p.isLocal);
 
@@ -47,7 +47,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     filterRef.current = currentFilter;
   }, [currentFilter]);
 
-  // Handshake timer logic
+  // 握手计时器
   useEffect(() => {
     let timer: number;
     if (role !== 'none' && connectionStatus !== 'connected' && handshakeTimer > 0) {
@@ -57,14 +57,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     }
     return () => clearInterval(timer);
   }, [role, connectionStatus, handshakeTimer]);
-
-  // Automatic Handshake execution for Receivers arriving via Link
-  useEffect(() => {
-    if (config.initialOffer && role === 'receiver' && connectionStatus === 'idle') {
-      console.log("Detecting initial offer, starting auto-reply...");
-      handleOfferAndReply();
-    }
-  }, [config.initialOffer]);
 
   const addParticipant = useCallback((p: Participant) => {
     setParticipants(prev => {
@@ -81,7 +73,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
-  // Filter engine for Mosaic/Blur
+  // 隐私滤镜引擎
   useEffect(() => {
     let animationFrame: number;
     const canvas = filterCanvasRef.current;
@@ -134,6 +126,38 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
   }, []);
 
+  // 接收方自动检测并回复逻辑
+  const handleOfferAndReply = useCallback(async (forcedOffer?: string) => {
+    const offerToProcess = forcedOffer || remoteSDPInput;
+    if (!offerToProcess) return;
+    try {
+      const decoded = JSON.parse(atob(offerToProcess));
+      setConnectionStatus('preparing');
+      const pc = await setupPeerConnection('peer', false);
+      await pc.setRemoteDescription(new RTCSessionDescription(decoded));
+      const answer = await pc.createAnswer(); 
+      await pc.setLocalDescription(answer);
+      
+      // 监测 ICE 收集
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') {
+          setLocalSDP(btoa(JSON.stringify(pc.localDescription))); 
+          setConnectionStatus('ready'); 
+          setHandshakeStep(2);
+        }
+      };
+    } catch (e) { 
+        console.error("Auto-handshake failed", e);
+        if (!forcedOffer) alert("请求包解析失败");
+    }
+  }, [remoteSDPInput]);
+
+  useEffect(() => {
+    if (config.initialOffer && role === 'receiver' && connectionStatus === 'idle') {
+      handleOfferAndReply(config.initialOffer);
+    }
+  }, [config.initialOffer, role, connectionStatus, handleOfferAndReply]);
+
   useEffect(() => {
     const init = async () => {
       encryptionKeyRef.current = await deriveKey(config.passphrase, config.roomId);
@@ -165,31 +189,23 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:stun3.l.google.com:19302' },
         { urls: 'stun:stun4.l.google.com:19302' }
-      ],
-      iceCandidatePoolSize: 10
+      ]
     });
-    
     peersRef.current.set(remoteId, pc);
     processedStreamRef.current?.getTracks().forEach(track => { 
       if (processedStreamRef.current) pc.addTrack(track, processedStreamRef.current); 
     });
-    
     pc.ontrack = (e) => { 
       addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
     };
-    
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected') setConnectionStatus('connected');
       if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
     };
-    
     if (isOffer) {
       const dc = pc.createDataChannel('secure-chat-tunnel', { ordered: true });
       setupDataChannel(remoteId, dc);
-    } else { 
-      pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); 
-    }
-    
+    } else { pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); }
     return pc;
   };
 
@@ -227,28 +243,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const decoded = JSON.parse(atob(remoteSDPInput));
       const pc = peersRef.current.get('peer');
       if (pc) await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-    } catch (e) { alert("握手包格式错误"); }
-  };
-
-  const handleOfferAndReply = async () => {
-    const offerToProcess = config.initialOffer || remoteSDPInput;
-    if (!offerToProcess) return;
-    try {
-      const decoded = JSON.parse(atob(offerToProcess));
-      setConnectionStatus('preparing');
-      const pc = await setupPeerConnection('peer', false);
-      await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-      const answer = await pc.createAnswer(); 
-      await pc.setLocalDescription(answer);
-      pc.onicegatheringstatechange = () => {
-        if (pc.iceGatheringState === 'complete') {
-          setLocalSDP(btoa(JSON.stringify(pc.localDescription))); setConnectionStatus('ready'); setHandshakeStep(2);
-        }
-      };
-    } catch (e) { 
-        console.error("Handshake auto-reply failed", e);
-        if (!config.initialOffer) alert("请求解析失败，请检查代码包"); 
-    }
+    } catch (e) { alert("响应包格式错误"); }
   };
 
   const getInviteLink = () => {
@@ -372,7 +367,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                     <div className="w-full max-w-3xl relative px-4">
                         <div className={`glass rounded-[2rem] lg:rounded-[3.5rem] p-6 lg:p-14 bg-black/80 border-t-8 transition-all ${role === 'initiator' ? 'border-t-primary' : 'border-t-accent'}`}>
                             
-                            {/* 握手倒计时显示 */}
                             <div className="flex items-center justify-between mb-8 opacity-60">
                                 <div className="flex items-center gap-2">
                                     <span className="material-symbols-outlined text-sm animate-spin-slow">history</span>
@@ -395,9 +389,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                                 </button>
                                             </div>
                                             <div className="space-y-4 text-left">
-                                                <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em]">STEP 2: 注入对方代码包</h4>
+                                                <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em]">STEP 2: 注入对方响应包</h4>
                                                 <div className="relative">
-                                                    <textarea placeholder="粘贴对方生成的握手包..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 lg:h-32 bg-black/40 border border-white/5 rounded-2xl p-4 lg:p-6 text-[10px] font-mono text-accent outline-none resize-none placeholder:opacity-30" />
+                                                    <textarea placeholder="粘贴对方生成的响应代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 lg:h-32 bg-black/40 border border-white/5 rounded-2xl p-4 lg:p-6 text-[10px] font-mono text-accent outline-none resize-none placeholder:opacity-30" />
                                                     <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-3 right-3 h-10 px-6 bg-accent text-black rounded-xl text-[10px] font-black uppercase tracking-widest active:scale-95 disabled:opacity-20 transition-all">建立隧道</button>
                                                 </div>
                                             </div>
@@ -409,7 +403,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                     <div className="space-y-4">
                                         <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em]">待同步请求包</h4>
                                         <textarea placeholder="粘贴发起方的请求代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 lg:h-32 bg-black/40 border border-white/5 rounded-2xl p-4 lg:p-6 text-[10px] font-mono text-accent outline-none resize-none placeholder:opacity-30" />
-                                        <button onClick={handleOfferAndReply} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase tracking-widest hover:bg-white/10 transition-all">计算响应包</button>
+                                        <button onClick={() => handleOfferAndReply()} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase tracking-widest hover:bg-white/10 transition-all">计算响应包</button>
                                     </div>
                                     {handshakeStep === 2 && (
                                         <div className="space-y-4">
@@ -424,7 +418,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
                             {handshakeTimer === 0 && (
                                 <div className="mt-8 pt-8 border-t border-white/5 text-center space-y-4 animate-in fade-in slide-in-from-bottom-2">
-                                    <p className="text-[10px] text-red-400 font-bold uppercase tracking-widest">握手时间已耗尽，请确保双方环境畅通</p>
+                                    <p className="text-[10px] text-red-400 font-bold uppercase tracking-widest">握手时间已耗尽</p>
                                     <button onClick={() => window.location.reload()} className="px-6 py-2 bg-white/5 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-gray-400 hover:text-white transition-colors">重置节点</button>
                                 </div>
                             )}
@@ -445,9 +439,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 )}
               </div>
               
-              {/* 本地视频预览框：移至左下角，并增加底部间距以避开底栏 */}
+              {/* 本地视频预览：左下角悬浮，避开底栏 */}
               {showLocalPreview && localParticipant && (
-                <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-10 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-90 duration-300">
+                <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-10 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-95 duration-300">
                   <VideoCard participant={localParticipant} filter={currentFilter} />
                 </div>
               )}
@@ -479,7 +473,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={toggleMyMic} danger={isMuted} label="静音" />
             <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={toggleMyPrivacy} label="马赛克" />
             <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏蔽画面" />
-            {/* 新增本地预览显示/隐藏按钮 */}
+            {/* 本地预览开关按钮 */}
             <ControlBtn icon={showLocalPreview ? 'picture_in_picture' : 'picture_in_picture_alt'} active={showLocalPreview} onClick={() => setShowLocalPreview(!showLocalPreview)} label="预览开关" />
           </div>
           <div className="w-px h-8 bg-white/10 mx-1"></div>
@@ -543,7 +537,7 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
                 </div>
                 <div className="space-y-1 px-10">
                     <p className="text-[11px] font-black uppercase tracking-[0.4em]">端对端加密通道</p>
-                    <p className="text-[9px] font-medium leading-relaxed">消息仅通过 P2P 隧道传输，关闭即物理抹除</p>
+                    <p className="text-[9px] font-medium leading-relaxed">消息仅通过 P2P 隧道传输</p>
                 </div>
             </div>
         )}
@@ -561,18 +555,18 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
                         <img src={m.blobUrl} className="w-full h-auto max-h-[500px] object-cover" loading="lazy" />
                     ) : (
                         <div className="p-4 lg:p-5 flex items-center gap-4 bg-black/20">
-                            <div className="size-11 rounded-xl bg-white/5 flex items-center justify-center border border-white/10">
-                                {/* 文件图标更改为 link 图标 */}
+                            <div className="size-11 rounded-xl bg-white/5 flex items-center justify-center border border-white/10 text-primary">
+                                {/* 文件图标换成 link 图标 */}
                                 <span className="material-symbols-outlined text-xl">link</span>
                             </div>
                             <div className="flex flex-col min-w-0">
                                 <span className="text-[11px] font-bold truncate pr-6 text-white">{m.fileName}</span>
-                                <span className="text-[8px] opacity-40 uppercase tracking-widest mt-0.5">Verified E2EE Data</span>
+                                <span className="text-[8px] opacity-40 uppercase tracking-widest mt-0.5 font-mono">P2P Encrypted Data</span>
                             </div>
                         </div>
                     )}
-                    <a href={m.blobUrl} download={m.fileName} className="absolute bottom-2 right-2 size-10 bg-black/80 rounded-xl flex items-center justify-center opacity-0 group-hover:opacity-100 lg:opacity-0 transition-opacity backdrop-blur-md border border-white/10 active:scale-90">
-                        <span className="material-symbols-outlined text-lg text-white">download</span>
+                    <a href={m.blobUrl} download={m.fileName} className="absolute bottom-2 right-2 size-10 bg-black/80 rounded-xl flex items-center justify-center opacity-0 group-hover:opacity-100 lg:opacity-0 transition-opacity backdrop-blur-md border border-white/10 active:scale-90 text-white">
+                        <span className="material-symbols-outlined text-lg">download</span>
                     </a>
                  </div>
                )}
