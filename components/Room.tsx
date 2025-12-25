@@ -42,25 +42,215 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const filterCanvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
   const filterRef = useRef<PrivacyFilter>(config.defaultFilter);
 
-  // 同步滤镜状态到 Ref 供 Canvas 渲染循环使用
+  // 1. 媒体资源初始化：必须先于握手
   useEffect(() => {
-    filterRef.current = currentFilter;
-  }, [currentFilter]);
+    const initMedia = async () => {
+      encryptionKeyRef.current = await deriveKey(config.passphrase, config.roomId);
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: { ideal: 1280 }, height: { ideal: 720 } }, 
+          audio: true 
+        });
+        rawStreamRef.current = stream;
+        
+        // 渲染引擎初始化
+        const canvas = filterCanvasRef.current;
+        const canvasStream = (canvas as any).captureStream(30);
+        const audioTrack = stream.getAudioTracks()[0];
+        if (audioTrack) canvasStream.addTrack(audioTrack);
+        processedStreamRef.current = canvasStream;
+        
+        addParticipant({ 
+          id: 'local', 
+          name: config.userName, 
+          isLocal: true, 
+          isHost: true, 
+          audioEnabled: true, 
+          videoEnabled: true, 
+          stream: canvasStream 
+        });
+      } catch (err) {
+        console.error("Media init error:", err);
+        alert("无法访问摄像头或麦克风，请检查权限。");
+      }
+    };
+    initMedia();
+    return () => {
+      peersRef.current.forEach(pc => pc.close());
+      rawStreamRef.current?.getTracks().forEach(t => t.stop());
+    };
+  }, [config.roomId, config.userName, config.passphrase]);
 
-  // 静音状态同步到流轨道
+  // 2. 核心隐私渲染循环
   useEffect(() => {
-    if (rawStreamRef.current) {
-      rawStreamRef.current.getAudioTracks().forEach(t => t.enabled = !isMuted);
-    }
+    let animationFrame: number;
+    const canvas = filterCanvasRef.current;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+
+    const render = () => {
+      if (ctx && video.readyState >= 2) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const filter = filterRef.current;
+
+        if (filter === PrivacyFilter.BLACK) {
+          ctx.fillStyle = '#06080a';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        } else if (filter === PrivacyFilter.MOSAIC) {
+          const scale = 0.02; 
+          const w = Math.max(1, canvas.width * scale);
+          const h = Math.max(1, canvas.height * scale);
+          ctx.imageSmoothingEnabled = false;
+          ctx.drawImage(video, 0, 0, w, h);
+          ctx.filter = 'blur(10px)'; 
+          ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+          ctx.filter = 'none';
+        } else {
+          ctx.drawImage(video, 0, 0);
+        }
+      }
+      animationFrame = requestAnimationFrame(render);
+    };
+
+    const checker = setInterval(() => {
+      if (rawStreamRef.current && video.srcObject !== rawStreamRef.current) {
+        video.srcObject = rawStreamRef.current;
+        video.play().then(() => render()).catch(() => {});
+      }
+    }, 500);
+
+    return () => {
+      cancelAnimationFrame(animationFrame);
+      clearInterval(checker);
+    };
+  }, []);
+
+  // 状态同步
+  useEffect(() => { filterRef.current = currentFilter; }, [currentFilter]);
+  useEffect(() => {
+    if (rawStreamRef.current) rawStreamRef.current.getAudioTracks().forEach(t => t.enabled = !isMuted);
   }, [isMuted]);
 
-  useEffect(() => {
-    let timer: number;
-    if (role !== 'none' && connectionStatus !== 'connected' && handshakeTimer > 0) {
-      timer = window.setInterval(() => setHandshakeTimer(prev => prev - 1), 1000);
+  // WebRTC 核心：创建连接
+  const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
+    const pc = new RTCPeerConnection({ 
+      iceServers: [
+        { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+        { urls: ['stun:stun2.l.google.com:19302', 'stun:stun3.l.google.com:19302'] }
+      ],
+      iceCandidatePoolSize: 10
+    });
+
+    peersRef.current.set(remoteId, pc);
+
+    // 关键：确保轨道在 Offer 之前添加
+    if (processedStreamRef.current) {
+      processedStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, processedStreamRef.current!);
+      });
     }
-    return () => clearInterval(timer);
-  }, [role, connectionStatus, handshakeTimer]);
+
+    pc.ontrack = (e) => {
+      console.log("Got remote track:", e.streams[0]);
+      addParticipant({ 
+        id: remoteId, 
+        name: "远端节点", 
+        isLocal: false, 
+        isHost: false, 
+        audioEnabled: true, 
+        videoEnabled: true, 
+        stream: e.streams[0] 
+      });
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log("PC State:", pc.connectionState);
+      if (pc.connectionState === 'connected') setConnectionStatus('connected');
+      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
+    };
+
+    if (isOffer) {
+      const dc = pc.createDataChannel('secure-chat-tunnel', { ordered: true });
+      setupDataChannel(remoteId, dc);
+    } else {
+      pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel);
+    }
+
+    return pc;
+  };
+
+  const setupDataChannel = (remoteId: string, dc: RTCDataChannel) => {
+    dataChannelsRef.current.set(remoteId, dc);
+    dc.onmessage = async (e) => {
+      if (typeof e.data === 'string') {
+        try {
+          const payload = JSON.parse(e.data);
+          if (payload.type === 'chat' && encryptionKeyRef.current) {
+            const text = await decryptMessage(encryptionKeyRef.current, payload.data, payload.iv);
+            setMessages(prev => [...prev, { id: Date.now().toString(), senderId: remoteId, senderName: '对方', text, type: 'text', timestamp: Date.now() }]);
+          } else if (payload.type === 'file-meta') handleFileMetaReceive(payload);
+        } catch (err) { console.error(err); }
+      } else handleFileChunkReceive(e.data);
+    };
+  };
+
+  // 握手逻辑
+  const startAsInitiator = async () => {
+    if (!processedStreamRef.current) return alert("等待媒体初始化...");
+    setRole('initiator'); 
+    setConnectionStatus('preparing');
+    const pc = await setupPeerConnection('peer', true);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === 'complete') {
+        setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
+        setConnectionStatus('ready');
+        setHandshakeStep(2);
+      }
+    };
+  };
+
+  const handleOfferAndReply = useCallback(async (forcedOffer?: string) => {
+    const offerStr = forcedOffer || remoteSDPInput;
+    if (!offerStr || !processedStreamRef.current) return;
+    try {
+      const offer = JSON.parse(atob(offerStr));
+      setConnectionStatus('preparing');
+      const pc = await setupPeerConnection('peer', false);
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') {
+          setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
+          setConnectionStatus('ready');
+          setHandshakeStep(2);
+        }
+      };
+    } catch (e) { alert("请求包无效"); }
+  }, [remoteSDPInput]);
+
+  const finalizeAsInitiator = async () => {
+    if (!remoteSDPInput) return;
+    try {
+      const answer = JSON.parse(atob(remoteSDPInput));
+      const pc = peersRef.current.get('peer');
+      if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (e) { alert("响应包无效"); }
+  };
+
+  useEffect(() => {
+    if (config.initialOffer && role === 'receiver' && connectionStatus === 'idle') {
+      const timer = setTimeout(() => handleOfferAndReply(config.initialOffer), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [config.initialOffer, role, connectionStatus, handleOfferAndReply]);
 
   const addParticipant = useCallback((p: Participant) => {
     setParticipants(prev => {
@@ -77,186 +267,65 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
-  // 核心隐私渲染引擎：直接处理并输出视频流
-  useEffect(() => {
-    let animationFrame: number;
-    const canvas = filterCanvasRef.current;
-    const ctx = canvas.getContext('2d', { alpha: false });
-    const video = document.createElement('video');
-    video.muted = true;
-    video.playsInline = true;
-
-    const render = () => {
-      if (ctx && video.readyState >= 2) {
-        const filter = filterRef.current;
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        if (filter === PrivacyFilter.BLACK) {
-          ctx.fillStyle = '#06080a';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-        } else if (filter === PrivacyFilter.MOSAIC) {
-          const scale = 0.02; 
-          const w = Math.max(1, canvas.width * scale);
-          const h = Math.max(1, canvas.height * scale);
-          ctx.imageSmoothingEnabled = false;
-          ctx.drawImage(video, 0, 0, w, h);
-          ctx.filter = 'blur(10px)'; 
-          ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
-          ctx.filter = 'none';
-        } else if (filter === PrivacyFilter.BLUR) {
-          ctx.filter = 'blur(60px)';
-          ctx.drawImage(video, 0, 0);
-          ctx.filter = 'none';
-        } else {
-          ctx.drawImage(video, 0, 0);
-        }
-      }
-      animationFrame = requestAnimationFrame(render);
-    };
-
-    const interval = setInterval(() => {
-      if (rawStreamRef.current && video.srcObject !== rawStreamRef.current) {
-        video.srcObject = rawStreamRef.current;
-        video.play().then(() => render()).catch(e => console.error("Filter engine failed", e));
-      }
-    }, 500);
-
-    return () => {
-      cancelAnimationFrame(animationFrame);
-      clearInterval(interval);
-      video.pause();
-      video.srcObject = null;
-    };
-  }, []);
-
-  const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
-    const pc = new RTCPeerConnection({ 
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' }
-      ]
-    });
-
-    peersRef.current.set(remoteId, pc);
-
-    // 将已处理（脱敏）的轨道推送到 Peer
-    processedStreamRef.current?.getTracks().forEach(track => { 
-      if (processedStreamRef.current) pc.addTrack(track, processedStreamRef.current); 
-    });
-
-    pc.ontrack = (e) => { 
-      addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
-    };
-
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') setConnectionStatus('connected');
-      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
-    };
-
-    if (isOffer) {
-      const dc = pc.createDataChannel('secure-chat-tunnel', { ordered: true });
-      setupDataChannel(remoteId, dc);
-    } else { 
-      pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); 
-    }
-    return pc;
-  };
-
-  const handleOfferAndReply = useCallback(async (forcedOffer?: string) => {
-    const offerToProcess = forcedOffer || remoteSDPInput;
-    if (!offerToProcess) return;
+  // 业务逻辑
+  const sendMessage = async (text: string) => {
+    if (!encryptionKeyRef.current) return;
     try {
-      const decoded = JSON.parse(atob(offerToProcess));
-      setConnectionStatus('preparing');
-      const pc = await setupPeerConnection('peer', false);
-      await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-      const answer = await pc.createAnswer(); 
-      await pc.setLocalDescription(answer);
-      
-      pc.onicegatheringstatechange = () => {
-        if (pc.iceGatheringState === 'complete') {
-          setLocalSDP(btoa(JSON.stringify(pc.localDescription))); 
-          setConnectionStatus('ready'); 
-          setHandshakeStep(2);
-        }
-      };
-    } catch (e) { 
-        console.error("Auto-handshake failed", e);
-        if (!forcedOffer) alert("请求包解析失败");
-    }
-  }, [remoteSDPInput]);
-
-  useEffect(() => {
-    if (config.initialOffer && role === 'receiver' && connectionStatus === 'idle') {
-      handleOfferAndReply(config.initialOffer);
-    }
-  }, [config.initialOffer, role, connectionStatus, handleOfferAndReply]);
-
-  useEffect(() => {
-    const init = async () => {
-      encryptionKeyRef.current = await deriveKey(config.passphrase, config.roomId);
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }, 
-          audio: true 
-        });
-        rawStreamRef.current = stream;
-        const canvasStream = (filterCanvasRef.current as any).captureStream(30);
-        const audioTrack = stream.getAudioTracks()[0];
-        if (audioTrack) {
-          audioTrack.enabled = !isMuted;
-          canvasStream.addTrack(audioTrack);
-        }
-        processedStreamRef.current = canvasStream;
-        addParticipant({ id: 'local', name: config.userName, isLocal: true, isHost: true, audioEnabled: true, videoEnabled: true, stream: canvasStream });
-      } catch (err) { console.error("Media init error:", err); }
-    };
-    init();
-    return () => {
-      peersRef.current.forEach(pc => pc.close());
-      rawStreamRef.current?.getTracks().forEach(t => t.stop());
-    };
-  }, [config.roomId, config.userName, config.passphrase, addParticipant]);
-
-  const setupDataChannel = (remoteId: string, dc: RTCDataChannel) => {
-    dataChannelsRef.current.set(remoteId, dc);
-    dc.onmessage = async (e) => {
-      if (typeof e.data === 'string') {
-        try {
-          const payload = JSON.parse(e.data);
-          if (payload.type === 'chat' && encryptionKeyRef.current) {
-            const text = await decryptMessage(encryptionKeyRef.current, payload.data, payload.iv);
-            setMessages(prev => [...prev, { id: Date.now().toString(), senderId: remoteId, senderName: '对方', text, type: 'text', timestamp: Date.now() }]);
-          } else if (payload.type === 'file-meta') handleFileMetaReceive(payload);
-        } catch (err) { console.error("Payload parse failed:", err); }
-      } else handleFileChunkReceive(e.data);
-    };
+      const encrypted = await encryptMessage(encryptionKeyRef.current, text);
+      const payload = JSON.stringify({ type: 'chat', ...encrypted });
+      dataChannelsRef.current.forEach(dc => dc.readyState === 'open' && dc.send(payload));
+      setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, type: 'text', timestamp: Date.now() }]);
+    } catch (e) { console.error(e); }
   };
 
-  const startAsInitiator = async () => {
-    setRole('initiator'); 
-    setConnectionStatus('preparing');
-    const pc = await setupPeerConnection('peer', true);
-    const offer = await pc.createOffer(); 
-    await pc.setLocalDescription(offer);
-    pc.onicegatheringstatechange = () => {
-      if (pc.iceGatheringState === 'complete') {
-        setLocalSDP(btoa(JSON.stringify(pc.localDescription))); setConnectionStatus('ready'); setHandshakeStep(2);
+  const handleFileUpload = async (file: File) => {
+    if (!encryptionKeyRef.current) return;
+    const fileId = Math.random().toString(36).substring(7);
+    const meta = { type: 'file-meta', id: fileId, name: file.name, size: file.size, mimeType: file.type };
+    dataChannelsRef.current.forEach(dc => dc.readyState === 'open' && dc.send(JSON.stringify(meta)));
+    
+    setFiles(prev => [{ id: fileId, name: file.name, size: file.size, progress: 0, status: 'transferring', mimeType: file.type }, ...prev]);
+
+    const buffer = await file.arrayBuffer();
+    const CHUNK_SIZE = 16384;
+    let offset = 0;
+
+    const sendNext = async () => {
+      if (offset >= buffer.byteLength) {
+        const blobUrl = URL.createObjectURL(new Blob([buffer], { type: file.type }));
+        setMessages(prev => [...prev, { id: fileId, senderId: 'local', senderName: config.userName, blobUrl, type: file.type.startsWith('image/') ? 'image' : 'file', fileName: file.name, timestamp: Date.now() }]);
+        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'completed' } : f));
+        return;
       }
+      const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+      const { data, iv } = await encryptBuffer(encryptionKeyRef.current!, chunk);
+      const packet = new Uint8Array(iv.length + data.byteLength);
+      packet.set(iv, 0); packet.set(new Uint8Array(data), iv.length);
+      dataChannelsRef.current.forEach(dc => dc.readyState === 'open' && dc.send(packet));
+      offset += CHUNK_SIZE;
+      setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.min(100, Math.round((offset/file.size)*100)) } : f));
+      setTimeout(sendNext, 2);
     };
+    sendNext();
   };
 
-  const finalizeAsInitiator = async () => {
-    if (!remoteSDPInput) return;
-    try {
-      const decoded = JSON.parse(atob(remoteSDPInput));
-      const pc = peersRef.current.get('peer');
-      if (pc) await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-    } catch (e) { alert("响应包解析失败"); }
+  const receivingRef = useRef<any>(null);
+  const handleFileMetaReceive = (meta: any) => {
+    receivingRef.current = { ...meta, chunks: [], received: 0 };
+    setFiles(prev => [{ id: meta.id, name: meta.name, size: meta.size, progress: 0, status: 'transferring', mimeType: meta.mimeType }, ...prev]);
+  };
+  const handleFileChunkReceive = async (data: ArrayBuffer) => {
+    const s = receivingRef.current; if (!s) return;
+    const iv = new Uint8Array(data.slice(0, 12));
+    const dec = await decryptBuffer(encryptionKeyRef.current!, data.slice(12), iv);
+    s.chunks.push(dec); s.received += dec.byteLength;
+    setFiles(prev => prev.map(f => f.id === s.id ? { ...f, progress: Math.min(100, Math.round((s.received/s.size)*100)) } : f));
+    if (s.received >= s.size) {
+      const blobUrl = URL.createObjectURL(new Blob(s.chunks, { type: s.mimeType }));
+      setMessages(prev => [...prev, { id: s.id, senderId: 'peer', senderName: '对方', blobUrl, type: s.mimeType?.startsWith('image/') ? 'image' : 'file', fileName: s.name, timestamp: Date.now() }]);
+      setFiles(prev => prev.map(f => f.id === s.id ? { ...f, status: 'completed' } : f));
+      receivingRef.current = null;
+    }
   };
 
   const getInviteLink = () => {
@@ -264,92 +333,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     url.hash = `room=${config.roomId}&pass=${config.passphrase}&offer=${localSDP}`;
     return url.toString();
   };
-
-  const sendMessage = async (text: string) => {
-    if (!encryptionKeyRef.current) return;
-    try {
-      const encrypted = await encryptMessage(encryptionKeyRef.current, text);
-      const payload = JSON.stringify({ type: 'chat', ...encrypted });
-      let hasSent = false;
-      dataChannelsRef.current.forEach(dc => { if (dc.readyState === 'open') { dc.send(payload); hasSent = true; } });
-      if (hasSent) setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, type: 'text', timestamp: Date.now() }]);
-    } catch (e) { console.error("Send failed", e); }
-  };
-
-  const handleFileUpload = async (file: File) => {
-    if (!encryptionKeyRef.current) return;
-    const fileId = Math.random().toString(36).substring(7);
-    const metaPayload = { type: 'file-meta', id: fileId, name: file.name, size: file.size, mimeType: file.type };
-    
-    setFiles(prev => [{ id: fileId, name: file.name, size: file.size, progress: 0, status: 'transferring', mimeType: file.type }, ...prev]);
-    dataChannelsRef.current.forEach(dc => { if (dc.readyState === 'open') dc.send(JSON.stringify(metaPayload)); });
-
-    const CHUNK_SIZE = 16384; // 16KB 稳定分片
-    const buffer = await file.arrayBuffer();
-    let offset = 0;
-
-    const sendChunk = async () => {
-      if (offset >= buffer.byteLength) {
-        const blobUrl = URL.createObjectURL(new Blob([buffer], { type: file.type }));
-        setMessages(prev => [...prev, { id: fileId, senderId: 'local', senderName: config.userName, blobUrl, type: file.type.startsWith('image/') ? 'image' : 'file', fileName: file.name, timestamp: Date.now() }]);
-        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'completed' } : f));
-        return;
-      }
-
-      const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
-      const { data, iv } = await encryptBuffer(encryptionKeyRef.current!, chunk);
-      const packet = new Uint8Array(iv.length + data.byteLength);
-      packet.set(iv, 0); 
-      packet.set(new Uint8Array(data), iv.length);
-
-      dataChannelsRef.current.forEach(dc => {
-        if (dc.readyState === 'open') {
-          if (dc.bufferedAmount < dc.bufferedAmountLowThreshold || 1024 * 1024) dc.send(packet);
-        }
-      });
-
-      offset += CHUNK_SIZE;
-      setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.min(100, Math.round((offset / file.size) * 100)) } : f));
-      setTimeout(sendChunk, 5); // 稍微延迟防止拥塞
-    };
-    sendChunk();
-  };
-
-  const receivingFileRef = useRef<{ id: string; name: string; size: number; received: number; chunks: ArrayBuffer[]; mimeType?: string } | null>(null);
-  
-  const handleFileMetaReceive = (meta: any) => {
-    receivingFileRef.current = { ...meta, received: 0, chunks: [] };
-    setFiles(prev => [{ id: meta.id, name: meta.name, size: meta.size, progress: 0, status: 'transferring', mimeType: meta.mimeType }, ...prev]);
-  };
-
-  const handleFileChunkReceive = async (data: ArrayBuffer) => {
-    const state = receivingFileRef.current; 
-    if (!state || !encryptionKeyRef.current) return;
-    try {
-      const iv = new Uint8Array(data.slice(0, 12));
-      const decryptedChunk = await decryptBuffer(encryptionKeyRef.current, data.slice(12), iv);
-      state.chunks.push(decryptedChunk); 
-      state.received += decryptedChunk.byteLength;
-      
-      setFiles(prev => prev.map(f => f.id === state.id ? { ...f, progress: Math.min(100, Math.round((state.received / state.size) * 100)) } : f));
-      
-      if (state.received >= state.size) {
-        const blobUrl = URL.createObjectURL(new Blob(state.chunks, { type: state.mimeType }));
-        setMessages(prev => [...prev, { id: state.id, senderId: 'peer', senderName: '对方', blobUrl, type: state.mimeType?.startsWith('image/') ? 'image' : 'file', fileName: state.name, timestamp: Date.now() }]);
-        setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
-        receivingFileRef.current = null;
-      }
-    } catch (e) { console.error("Decryption error in chunk", e); }
-  };
-
-  // Add missing toggle functions for privacy filters
-  const toggleMyPrivacy = useCallback(() => {
-    setCurrentFilter(prev => prev === PrivacyFilter.MOSAIC ? PrivacyFilter.NONE : PrivacyFilter.MOSAIC);
-  }, []);
-
-  const toggleMyVideo = useCallback(() => {
-    setCurrentFilter(prev => prev === PrivacyFilter.BLACK ? PrivacyFilter.NONE : PrivacyFilter.BLACK);
-  }, []);
 
   return (
     <div className="flex flex-col h-[100dvh] bg-background overflow-hidden relative font-sans">
@@ -393,33 +376,28 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 ) : (
                     <div className="w-full max-w-3xl relative px-4">
                         <div className={`glass rounded-[2rem] lg:rounded-[3.5rem] p-6 lg:p-14 bg-black/80 border-t-8 transition-all ${role === 'initiator' ? 'border-t-primary' : 'border-t-accent'}`}>
-                            
                             <div className="flex items-center justify-between mb-8 opacity-60">
-                                <div className="flex items-center gap-2">
-                                    <span className="material-symbols-outlined text-sm animate-spin-slow">history</span>
-                                    <span className="text-[10px] font-mono font-bold uppercase tracking-widest">握手窗口</span>
-                                </div>
-                                <span className={`text-sm font-mono font-black ${handshakeTimer < 30 ? 'text-red-500 animate-pulse' : 'text-primary'}`}>
-                                    {Math.floor(handshakeTimer / 60)}:{(handshakeTimer % 60).toString().padStart(2, '0')}
+                                <div className="flex items-center gap-2 text-[10px] font-mono font-bold uppercase tracking-widest">握手窗口</div>
+                                <span className="text-sm font-mono font-black text-primary">
+                                    {Math.floor(handshakeTimer/60)}:{(handshakeTimer%60).toString().padStart(2, '0')}
                                 </span>
                             </div>
-
                             {role === 'initiator' ? (
-                                <div className="space-y-6 text-center">
+                                <div className="space-y-6">
                                     {handshakeStep === 2 && (
                                         <div className="space-y-8">
                                             <div className="space-y-4">
-                                                <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em] text-left">STEP 1: 发送魔术链接</h4>
-                                                <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-primary/10 border-2 border-primary/20 hover:border-primary text-primary rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all active:scale-95">
+                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left">STEP 1: 发送链接</h4>
+                                                <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-primary/10 border-2 border-primary/20 hover:border-primary text-primary rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all">
                                                     <span className="material-symbols-outlined text-xl">{isCopied ? 'done_all' : 'content_copy'}</span>
-                                                    <span className="text-sm">{isCopied ? '已准备好发送' : '复制连接请求'}</span>
+                                                    <span>{isCopied ? '已复制' : '复制连接请求'}</span>
                                                 </button>
                                             </div>
-                                            <div className="space-y-4 text-left">
-                                                <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em]">STEP 2: 注入对方响应包</h4>
+                                            <div className="space-y-4">
+                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left">STEP 2: 注入响应</h4>
                                                 <div className="relative">
-                                                    <textarea placeholder="粘贴对方生成的响应代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 lg:h-32 bg-black/40 border border-white/5 rounded-2xl p-4 lg:p-6 text-[10px] font-mono text-accent outline-none resize-none placeholder:opacity-30" />
-                                                    <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-3 right-3 h-10 px-6 bg-accent text-black rounded-xl text-[10px] font-black uppercase tracking-widest active:scale-95 disabled:opacity-20 transition-all">建立隧道</button>
+                                                    <textarea placeholder="粘贴对方的响应..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none" />
+                                                    <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-3 right-3 h-10 px-6 bg-accent text-black rounded-xl text-[10px] font-black uppercase active:scale-95 disabled:opacity-20 transition-all">建立隧道</button>
                                                 </div>
                                             </div>
                                         </div>
@@ -428,14 +406,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                             ) : (
                                 <div className="space-y-8">
                                     <div className="space-y-4">
-                                        <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em]">待同步请求包</h4>
-                                        <textarea placeholder="粘贴发起方的请求代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 lg:h-32 bg-black/40 border border-white/5 rounded-2xl p-4 lg:p-6 text-[10px] font-mono text-accent outline-none resize-none placeholder:opacity-30" />
-                                        <button onClick={() => handleOfferAndReply()} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase tracking-widest hover:bg-white/10 transition-all">计算响应包</button>
+                                        <h4 className="text-[10px] font-black uppercase tracking-widest text-left">注入请求包</h4>
+                                        <textarea placeholder="粘贴发起方的请求..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none" />
+                                        <button onClick={() => handleOfferAndReply()} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase hover:bg-white/10 transition-all">计算响应</button>
                                     </div>
                                     {handshakeStep === 2 && (
                                         <div className="space-y-4">
-                                            <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em]">将响应代码传回对方</h4>
-                                            <button onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-accent text-black rounded-2xl text-xs font-black uppercase tracking-widest active:scale-95 transition-all">
+                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left">复制并返回响应</h4>
+                                            <button onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-accent text-black rounded-2xl text-xs font-black uppercase active:scale-95 transition-all">
                                                 {isCopied ? '响应已复制' : '复制我的响应代码'}
                                             </button>
                                         </div>
@@ -458,7 +436,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                   </div>
                 )}
               </div>
-              
               {showLocalPreview && localParticipant && (
                 <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-8 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-95">
                   <VideoCard participant={localParticipant} filter={currentFilter} />
@@ -468,30 +445,30 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           )}
         </div>
 
-        {/* 聊天侧边栏 - PC端响应式宽度，移动端Overlay */}
-        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[25vw] lg:min-w-[380px] lg:max-w-[500px] glass transform transition-all duration-300 ease-[cubic-bezier(0.23,1,0.32,1)] z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
+        {/* 聊天侧边栏：PC 响应式，Mobile 全屏 Overlay */}
+        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[min(450px,30vw)] glass transform transition-all duration-300 ease-[cubic-bezier(0.23,1,0.32,1)] z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/90 shrink-0">
                 <div className="flex items-center gap-2.5">
                     <span className="size-2 rounded-full bg-accent animate-pulse"></span>
-                    <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-white/90">加密通讯隧道</h3>
+                    <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-white/90">加密隧道</h3>
                 </div>
                 <button onClick={() => setIsChatOpen(false)} className="size-10 rounded-full hover:bg-white/5 flex items-center justify-center text-gray-500 transition-all active:scale-90">
                     <span className="material-symbols-outlined text-2xl">close</span>
                 </button>
              </div>
              <div className="flex-1 overflow-hidden bg-[#0a0c0e] flex flex-col relative">
-                {/* 注意：移动端时增加 padding-bottom 避开底栏输入框以外的区域 */}
-                <ChatBox messages={messages} onSend={sendMessage} onUpload={handleFileUpload} isChatOpen={isChatOpen} />
+                <ChatBox messages={messages} onSend={sendMessage} onUpload={handleFileUpload} />
              </div>
         </div>
       </main>
 
+      {/* 控制栏：移动端聊天开启时调整 Z-Index 避免干扰 */}
       {connectionStatus === 'connected' && (
-        <div className="fixed bottom-4 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-1.5 lg:gap-8 p-2 lg:p-4 glass rounded-[2.5rem] lg:rounded-[3.5rem] z-[120] shadow-[0_30px_60px_-15px_rgba(0,0,0,0.8)] border border-white/10 animate-in slide-in-from-bottom-8">
+        <div className={`fixed bottom-4 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-1.5 lg:gap-8 p-2 lg:p-4 glass rounded-[2.5rem] lg:rounded-[3.5rem] shadow-[0_30px_60px_-15px_rgba(0,0,0,0.8)] border border-white/10 animate-in slide-in-from-bottom-8 ${isChatOpen ? 'z-[10] opacity-0 lg:opacity-100' : 'z-[120]'}`}>
           <div className="flex items-center gap-1 lg:gap-3 px-1.5">
             <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={() => setIsMuted(!isMuted)} danger={isMuted} label="静音" />
-            <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={toggleMyPrivacy} label="马赛克" />
-            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏蔽画面" />
+            <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={() => setCurrentFilter(prev => prev === PrivacyFilter.MOSAIC ? PrivacyFilter.NONE : PrivacyFilter.MOSAIC)} label="马赛克" />
+            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={() => setCurrentFilter(prev => prev === PrivacyFilter.BLACK ? PrivacyFilter.NONE : PrivacyFilter.BLACK)} danger={currentFilter === PrivacyFilter.BLACK} label="屏蔽画面" />
             <ControlBtn icon={showLocalPreview ? 'picture_in_picture' : 'picture_in_picture_alt'} active={showLocalPreview} onClick={() => setShowLocalPreview(!showLocalPreview)} label="预览开关" />
           </div>
           <div className="w-px h-8 bg-white/10 mx-1"></div>
@@ -511,94 +488,54 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
 const ControlBtn = ({ icon, active, onClick, danger, label, badge }: { icon: string; active: boolean; onClick: () => void; danger?: boolean; label: string; badge?: boolean }) => (
   <div className="flex flex-col items-center gap-1.5 group">
-    <button 
-      onClick={onClick} 
-      className={`relative size-10 lg:size-14 rounded-full flex items-center justify-center transition-all border ${active ? 'bg-primary/10 border-primary/30 text-primary shadow-[0_0_15px_rgba(19,127,236,0.15)]' : (danger ? 'bg-red-500/10 border-red-500/20 text-red-500' : 'bg-white/5 border-white/5 text-gray-500')} hover:scale-110 active:scale-90`}
-    >
+    <button onClick={onClick} className={`relative size-10 lg:size-14 rounded-full flex items-center justify-center transition-all border ${active ? 'bg-primary/10 border-primary/30 text-primary' : (danger ? 'bg-red-500/10 border-red-500/20 text-red-500' : 'bg-white/5 border-white/5 text-gray-500')} hover:scale-110 active:scale-90`}>
       <span className="material-symbols-outlined text-[20px] lg:text-[26px]">{icon}</span>
       {badge && <span className="absolute top-0 right-0 size-2 bg-primary rounded-full ring-2 ring-black"></span>}
     </button>
-    <span className="text-[7px] lg:text-[10px] font-black uppercase text-gray-600 tracking-tighter hidden md:block whitespace-nowrap">{label}</span>
+    <span className="text-[7px] lg:text-[10px] font-black uppercase text-gray-600 hidden md:block">{label}</span>
   </div>
 );
 
-const ChatBox = ({ messages, onSend, onUpload, isChatOpen }: { messages: ChatMessage[]; onSend: (t: string) => void; onUpload: (f: File) => void, isChatOpen: boolean }) => {
+const ChatBox = ({ messages, onSend, onUpload }: { messages: ChatMessage[]; onSend: (t: string) => void; onUpload: (f: File) => void }) => {
   const [text, setText] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  
-  useEffect(() => { 
-    if (scrollRef.current) {
-      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-    }
-  }, [messages]);
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (text.trim()) { onSend(text); setText(''); }
-  };
+  useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }); }, [messages]);
+  const handleSubmit = (e: React.FormEvent) => { e.preventDefault(); if (text.trim()) { onSend(text); setText(''); } };
   
   return (
-    <div className="flex flex-col h-full relative overflow-hidden bg-[#080a0c]">
-      {/* 底部增加 pb-40 确保内容不被移动端输入框和底栏遮挡 */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6 custom-scrollbar pb-36 lg:pb-32">
+    <div className="flex flex-col h-full bg-[#080a0c]">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 pb-32 lg:pb-32 custom-scrollbar">
         {messages.length === 0 && (
-            <div className="h-full flex flex-col items-center justify-center text-center opacity-20 py-20 grayscale">
-                <span className="material-symbols-outlined text-5xl mb-4">vpn_lock</span>
-                <p className="text-[11px] font-black uppercase tracking-[0.4em]">端对端加密通道</p>
-                <p className="text-[9px] font-medium leading-relaxed mt-1">对话实时销毁中</p>
-            </div>
+          <div className="h-full flex flex-col items-center justify-center text-center opacity-20 py-20 grayscale">
+            <span className="material-symbols-outlined text-5xl mb-4">vpn_lock</span>
+            <p className="text-[11px] font-black uppercase tracking-[0.4em]">端对端隧道已建立</p>
+          </div>
         )}
         {messages.map(m => (
           <div key={m.id} className={`flex flex-col ${m.senderId === 'local' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-2`}>
-             <div className="flex items-center gap-2 mb-1.5 px-1.5">
-                <span className={`text-[9px] font-black uppercase tracking-widest ${m.senderId === 'local' ? 'text-primary' : 'text-gray-500'}`}>{m.senderName}</span>
-                <span className="text-[7px] font-mono text-gray-700">{new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-             </div>
-             <div className={`rounded-2xl max-w-[90%] overflow-hidden shadow-2xl transition-all ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-[#1a1f26] border border-white/10 text-gray-200 rounded-tl-none'}`}>
-               {m.type === 'text' && <p className="px-4 py-3 text-[13px] leading-relaxed break-words font-medium">{m.text}</p>}
+             <span className="text-[9px] font-black uppercase text-gray-500 mb-1 px-1">{m.senderName}</span>
+             <div className={`rounded-2xl max-w-[90%] overflow-hidden shadow-xl ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-[#1a1f26] border border-white/10 text-gray-200 rounded-tl-none'}`}>
+               {m.type === 'text' && <p className="px-4 py-2.5 text-[13px] leading-relaxed break-words">{m.text}</p>}
                {m.blobUrl && (
                  <div className="relative group min-w-[200px]">
-                    {m.type === 'image' ? (
-                        <img src={m.blobUrl} className="w-full h-auto max-h-[500px] object-cover" />
-                    ) : (
-                        <div className="p-4 flex items-center gap-4 bg-black/20">
-                            <div className="size-11 rounded-xl bg-white/5 flex items-center justify-center border border-white/10 text-primary">
-                                <span className="material-symbols-outlined text-xl">link</span>
-                            </div>
-                            <div className="flex flex-col min-w-0">
-                                <span className="text-[11px] font-bold truncate pr-6 text-white">{m.fileName}</span>
-                                <span className="text-[8px] opacity-40 uppercase tracking-widest mt-0.5">Verified E2EE Data</span>
-                            </div>
-                        </div>
+                    {m.type === 'image' ? <img src={m.blobUrl} className="w-full h-auto max-h-[400px] object-cover" /> : (
+                      <div className="p-4 flex items-center gap-4 bg-black/20">
+                        <span className="material-symbols-outlined text-primary text-xl">link</span>
+                        <div className="flex flex-col min-w-0"><span className="text-[11px] font-bold truncate text-white">{m.fileName}</span></div>
+                      </div>
                     )}
-                    <a href={m.blobUrl} download={m.fileName} className="absolute bottom-2 right-2 size-10 bg-black/80 rounded-xl flex items-center justify-center text-white border border-white/10 hover:bg-primary transition-colors">
-                        <span className="material-symbols-outlined text-lg">download</span>
-                    </a>
+                    <a href={m.blobUrl} download={m.fileName} className="absolute bottom-2 right-2 size-10 bg-black/80 rounded-xl flex items-center justify-center text-white border border-white/10"><span className="material-symbols-outlined text-lg">download</span></a>
                  </div>
                )}
              </div>
           </div>
         ))}
       </div>
-      
-      {/* 底部输入框容器 */}
       <div className="absolute bottom-0 inset-x-0 p-4 lg:p-6 bg-gradient-to-t from-black via-black/95 to-transparent backdrop-blur-sm border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
-        <form onSubmit={handleSubmit} className="flex gap-3 max-w-4xl mx-auto items-center">
-          <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 active:scale-95 transition-all">
-              <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
-              <span className="material-symbols-outlined text-2xl">link</span>
-          </label>
-          <input 
-            ref={inputRef}
-            className="flex-1 h-12 bg-white/5 border border-white/10 rounded-xl px-5 text-[13px] text-white focus:outline-none focus:border-primary/50 transition-all" 
-            placeholder="加密消息..." 
-            value={text} 
-            onChange={(e) => setText(e.target.value)} 
-          />
-          <button type="submit" disabled={!text.trim()} className="shrink-0 size-12 bg-primary text-white rounded-xl flex items-center justify-center disabled:opacity-20 active:scale-95 shadow-xl shadow-primary/30 transition-all">
-            <span className="material-symbols-outlined text-2xl">arrow_upward</span>
-          </button>
+        <form onSubmit={handleSubmit} className="flex gap-3 items-center">
+          <label className="shrink-0 size-11 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer active:scale-95"><input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} /><span className="material-symbols-outlined text-xl">link</span></label>
+          <input className="flex-1 h-11 bg-white/5 border border-white/10 rounded-xl px-4 text-[13px] text-white focus:outline-none focus:border-primary/50 transition-all" placeholder="加密消息..." value={text} onChange={(e) => setText(e.target.value)} />
+          <button type="submit" disabled={!text.trim()} className="shrink-0 size-11 bg-primary text-white rounded-xl flex items-center justify-center disabled:opacity-20 active:scale-95 shadow-lg shadow-primary/30"><span className="material-symbols-outlined text-xl">arrow_upward</span></button>
         </form>
       </div>
     </div>
