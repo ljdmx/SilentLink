@@ -18,7 +18,7 @@ const Landing: React.FC<LandingProps> = ({ onNavigateToSetup, onViewDesign }) =>
             <div className="size-10 bg-primary flex items-center justify-center rounded-xl shadow-2xl shadow-primary/40">
                 <span className="material-symbols-outlined text-white text-xl fill-1">shield</span>
             </div>
-            <span className="font-black text-xl tracking-tight">SECURE<span className="text-primary">COMM</span></span>
+            <span className="font-black text-xl tracking-tight">SILENT<span className="text-primary">LINK</span></span>
         </div>
 
         <div className="relative z-10 space-y-8">

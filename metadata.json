@@ -1,5 +1,6 @@
+
 {
-  "name": "SecureComm - 零存储端到端加密通信",
+  "name": "SilentLink - 零存储端到端加密通信 2.0",
   "description": "基于 WebRTC 的隐私保护实时通信工具，支持 E2EE 加密、视频隐私滤镜和零数据留存。",
   "requestFramePermissions": [
     "camera",
