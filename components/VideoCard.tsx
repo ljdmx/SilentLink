@@ -26,20 +26,19 @@ const VideoCard: React.FC<VideoCardProps> = ({ participant, filter, isLarge }) =
       let animationFrame: number;
       
       const render = () => {
-        if (ctx && video.readyState >= 2) {
-          canvas.width = video.videoWidth;
-          canvas.height = video.videoHeight;
+        if (ctx && video.readyState >= 2 && video.srcObject) {
+          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          }
           
-          // Enhanced Mosaic: Small scale factor + Blur
           const scale = 0.03; 
           const w = canvas.width * scale;
           const h = canvas.height * scale;
           
-          // Step 1: Pixelate
           ctx.imageSmoothingEnabled = false;
           ctx.drawImage(video, 0, 0, w, h);
           
-          // Step 2: Draw back with blur to satisfy "马赛克的时候高度模糊"
           ctx.filter = 'blur(8px)';
           ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
           ctx.filter = 'none';
@@ -47,7 +46,9 @@ const VideoCard: React.FC<VideoCardProps> = ({ participant, filter, isLarge }) =
         animationFrame = requestAnimationFrame(render);
       };
       render();
-      return () => cancelAnimationFrame(animationFrame);
+      return () => {
+        if (animationFrame) cancelAnimationFrame(animationFrame);
+      };
     }
   }, [filter]);
 
@@ -76,25 +77,29 @@ const VideoCard: React.FC<VideoCardProps> = ({ participant, filter, isLarge }) =
         </div>
       )}
 
-      {/* 渐变遮罩 - 仅对远端显示 */}
       {!participant.isLocal && (
         <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/80 to-transparent pointer-events-none"></div>
       )}
       
-      {/* 名字标签 - 仅对远端显示 */}
       {!participant.isLocal && (
         <div className="absolute top-4 left-4 flex flex-wrap gap-2 max-w-[80%] z-10">
           <div className="px-3 py-1.5 bg-black/60 backdrop-blur-xl rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 border border-white/5 shadow-xl">
-            <span className={`size-1.5 rounded-full ${participant.audioEnabled ? 'bg-accent shadow-[0_0_6px_rgba(34,197,94,0.6)]' : 'bg-red-500 animate-pulse'}`}></span>
+            <span className={`size-1.5 rounded-full ${participant.audioEnabled ? 'bg-accent shadow-[0_0_6px_rgba(34,197,94,0.6)]' : 'bg-red-500 animate-pulse shadow-[0_0_6px_rgba(239,68,68,0.4)]'}`}></span>
             <span className="truncate max-w-[150px] text-white/90">{participant.name}</span>
           </div>
+          
+          {(!participant.audioEnabled || !participant.videoEnabled) && (
+            <div className="px-2 py-1.5 bg-red-500/20 backdrop-blur-xl rounded-xl border border-red-500/30 flex items-center gap-1">
+               {!participant.audioEnabled && <span className="material-symbols-outlined text-[12px] text-red-500">mic_off</span>}
+               {!participant.videoEnabled && <span className="material-symbols-outlined text-[12px] text-red-500">visibility_off</span>}
+            </div>
+          )}
         </div>
       )}
 
-      {/* 状态指示器 - 去除右下角语音图标，仅在隐私滤镜开启时对远端显示状态 */}
       {!participant.isLocal && filter !== PrivacyFilter.NONE && (
         <div className="absolute bottom-4 right-4 flex gap-2 z-10">
-            <div className="size-9 rounded-xl bg-primary/20 backdrop-blur-xl flex items-center justify-center text-primary shadow-lg border border-primary/20">
+            <div className="size-9 rounded-xl bg-primary/20 backdrop-blur-xl flex items-center justify-center text-primary shadow-lg border border-primary/20 animate-pulse">
                 <span className="material-symbols-outlined text-[18px]">privacy_tip</span>
             </div>
         </div>

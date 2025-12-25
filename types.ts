@@ -45,6 +45,23 @@ export interface FileTransfer {
   mimeType?: string;
 }
 
+export interface ReceivingFileState {
+  id: string;
+  name: string;
+  size: number;
+  received: number;
+  chunks: ArrayBuffer[];
+  mimeType?: string;
+}
+
+export interface FileMetaPayload {
+  type: 'file-meta';
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+}
+
 export interface RoomConfig {
   roomId: string;
   passphrase: string;
@@ -52,5 +69,5 @@ export interface RoomConfig {
   recordingProtection: boolean;
   ephemeralSession: boolean;
   defaultFilter: PrivacyFilter;
-  initialOffer?: string; // Add this for auto-handshake
+  initialOffer?: string;
 }
