@@ -53,7 +53,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     toastTimerRef.current = window.setTimeout(() => setToast(null), 3000);
   }, []);
 
-  // 资源彻底回收函数
   const cleanupResources = useCallback(() => {
     peersRef.current.forEach(pc => pc.close());
     peersRef.current.clear();
@@ -65,7 +64,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   }, []);
 
   const handleManualExit = useCallback(() => {
-    // 退出前尝试通知对方
     const termMsg = JSON.stringify({ type: 'session-terminate' });
     dataChannelsRef.current.forEach(dc => {
       if (dc.readyState === 'open') dc.send(termMsg);
@@ -98,7 +96,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           audio: true 
         });
         rawStreamRef.current = stream;
-        
         const canvas = filterCanvasRef.current;
         const canvasStream = (canvas as any).captureStream(30);
         const audioTrack = stream.getAudioTracks()[0];
@@ -107,7 +104,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           canvasStream.addTrack(audioTrack);
         }
         processedStreamRef.current = canvasStream;
-        
         addOrUpdateParticipant({ 
           id: 'local', 
           name: config.userName, 
@@ -118,7 +114,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           stream: canvasStream 
         });
       } catch (err) {
-        console.error("Media init error:", err);
         showToast("无法获取本地媒体权限", "error");
       }
     };
@@ -145,14 +140,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     }
     return () => clearInterval(interval);
   }, [role, connectionStatus, handshakeTimer]);
-
-  useEffect(() => {
-    if (remoteParticipant?.stream) {
-      remoteParticipant.stream.getAudioTracks().forEach(t => {
-        t.enabled = !isRemoteMuted;
-      });
-    }
-  }, [isRemoteMuted, remoteParticipant?.stream]);
 
   useEffect(() => {
     let animationFrame: number;
@@ -223,10 +210,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     }
   }, [currentFilter, isMuted, connectionStatus, syncMyPrivacyState]);
 
-  useEffect(() => {
-    if (rawStreamRef.current) rawStreamRef.current.getAudioTracks().forEach(t => t.enabled = !isMuted);
-  }, [isMuted]);
-
   const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
     const pc = new RTCPeerConnection({ 
       iceServers: [
@@ -257,12 +240,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-        showToast("对方连接断开，即将同步退出", "info");
         setTimeout(() => {
           if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
             handleManualExit();
           }
-        }, 3000);
+        }, 5000);
       }
     };
 
@@ -303,8 +285,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             showToast("文件传输取消", "error");
             setFiles(prev => prev.map(f => f.id === payload.id ? { ...f, status: 'failed' } : f));
           } else if (payload.type === 'session-terminate') {
-            showToast("对方已关闭会话", "info");
-            setTimeout(handleManualExit, 1000);
+            handleManualExit();
           }
         } catch (err) { console.error("Protocol error:", err); }
       } else handleFileChunkReceive(e.data);
@@ -312,57 +293,72 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   };
 
   const startAsInitiator = async () => {
-    if (!processedStreamRef.current) return showToast("等待媒体流就绪...", "info");
-    setRole('initiator'); 
+    if (!processedStreamRef.current) return showToast("正在初始化媒体，请稍候...", "info");
+    
+    // 立即进入页面
+    setRole('initiator');
+    setHandshakeStep(2);
     setConnectionStatus('preparing');
-    const pc = await setupPeerConnection('peer', true);
-    pc.onicegatheringstatechange = () => {
+    
+    try {
+      const pc = await setupPeerConnection('peer', true);
+      pc.onicegatheringstatechange = () => {
+        if (pc.iceGatheringState === 'complete') {
+          setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
+          setConnectionStatus('ready');
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      
+      // 快速检查
       if (pc.iceGatheringState === 'complete') {
         setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
         setConnectionStatus('ready');
-        setHandshakeStep(2);
       }
-    };
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    if (pc.iceGatheringState === 'complete') {
-      setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
-      setConnectionStatus('ready');
-      setHandshakeStep(2);
+    } catch (e) {
+      showToast("无法创建握手请求", "error");
+      setRole('none');
     }
   };
 
   const handleOfferAndReply = useCallback(async (forcedOffer?: string) => {
     const offerStr = forcedOffer || remoteSDPInput;
     if (!offerStr) return;
+    
     if (!processedStreamRef.current) {
         setTimeout(() => handleOfferAndReply(forcedOffer), 500);
         return;
     }
+
     if (processedOfferRef.current === offerStr) return;
     processedOfferRef.current = offerStr;
+    
+    // 立即进入响应状态 UI
+    setHandshakeStep(2);
+    setConnectionStatus('preparing');
+    
     try {
       const offer = JSON.parse(atob(offerStr));
-      setConnectionStatus('preparing');
       const pc = await setupPeerConnection('peer', false);
       pc.onicegatheringstatechange = () => {
         if (pc.iceGatheringState === 'complete') {
           setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
           setConnectionStatus('ready');
-          setHandshakeStep(2);
         }
       };
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+      
       if (pc.iceGatheringState === 'complete') {
         setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
         setConnectionStatus('ready');
-        setHandshakeStep(2);
       }
     } catch (e) { 
-      showToast("解析请求包失败", "error");
+      showToast("无效的请求包", "error");
       processedOfferRef.current = null;
+      setHandshakeStep(1);
     }
   }, [remoteSDPInput, showToast]);
 
@@ -372,7 +368,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const answer = JSON.parse(atob(remoteSDPInput));
       const pc = peersRef.current.get('peer');
       if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch (e) { showToast("握手响应包无效", "error"); }
+    } catch (e) { showToast("响应包无效", "error"); }
   };
 
   useEffect(() => {
@@ -381,13 +377,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       return () => clearTimeout(timer);
     }
   }, [config.initialOffer, role, connectionStatus, handleOfferAndReply]);
-
-  const removeParticipant = useCallback((id: string) => {
-    setParticipants(prev => prev.filter(u => u.id !== id));
-    const pc = peersRef.current.get(id);
-    if (pc) { pc.close(); peersRef.current.delete(id); }
-    dataChannelsRef.current.delete(id);
-  }, []);
 
   const createAndTrackBlobUrl = (blob: Blob) => {
     const url = URL.createObjectURL(blob);
@@ -410,7 +399,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       if (anySent) {
         setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, type: 'text', timestamp: Date.now() }]);
       } else {
-        showToast("发送失败：隧道断开", "error");
+        showToast("隧道断开，无法发送", "error");
       }
     } catch (e) { console.error(e); }
   };
@@ -549,38 +538,47 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                             </div>
                             {role === 'initiator' ? (
                                 <div className="space-y-6">
-                                    {handshakeStep === 2 && (
-                                        <div className="space-y-8">
-                                            <div className="space-y-4">
-                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 1: 复制并发送请求链接</h4>
-                                                <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-primary/10 border-2 border-primary/20 hover:border-primary text-primary rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all active:scale-95">
-                                                    <span className="material-symbols-outlined text-xl">{isCopied ? 'done_all' : 'content_copy'}</span>
-                                                    <span>{isCopied ? '链接已复制' : '复制安全请求链接'}</span>
-                                                </button>
-                                            </div>
-                                            <div className="space-y-4">
-                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 2: 粘贴对方响应代码</h4>
-                                                <div className="relative">
-                                                    <textarea placeholder="粘贴响应代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
-                                                    <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-3 right-3 h-10 px-6 bg-accent text-black rounded-xl text-[10px] font-black uppercase active:scale-95 disabled:opacity-20 transition-all">建立隧道</button>
-                                                </div>
+                                    <div className="space-y-8">
+                                        <div className="space-y-4">
+                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 1: 复制并发送请求链接</h4>
+                                            <button 
+                                              disabled={!localSDP}
+                                              onClick={() => {if(localSDP){navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}}} 
+                                              className="w-full h-14 bg-primary/10 border-2 border-primary/20 hover:border-primary text-primary rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all active:scale-95 disabled:opacity-50"
+                                            >
+                                                <span className="material-symbols-outlined text-xl">{localSDP ? (isCopied ? 'done_all' : 'content_copy') : 'sync'}</span>
+                                                <span>{localSDP ? (isCopied ? '链接已复制' : '复制安全请求链接') : '正在计算加密载荷...'}</span>
+                                            </button>
+                                        </div>
+                                        <div className="space-y-4">
+                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 2: 粘贴对方响应代码</h4>
+                                            <div className="relative">
+                                                <textarea placeholder="粘贴响应代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
+                                                <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-3 right-3 h-10 px-6 bg-accent text-black rounded-xl text-[10px] font-black uppercase active:scale-95 disabled:opacity-20 transition-all">开启隧道</button>
                                             </div>
                                         </div>
-                                    )}
+                                    </div>
                                 </div>
                             ) : (
                                 <div className="space-y-8">
-                                    <div className="space-y-4">
-                                        <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">注入请求包</h4>
-                                        <textarea placeholder="粘贴请求代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
-                                        <button onClick={() => handleOfferAndReply()} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase hover:bg-white/10 transition-all active:scale-95">计算响应代码</button>
-                                    </div>
-                                    {handshakeStep === 2 && (
+                                    {handshakeStep === 1 ? (
                                         <div className="space-y-4">
-                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">返回响应代码</h4>
-                                            <button onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-accent text-black rounded-2xl text-xs font-black uppercase active:scale-95 transition-all">
-                                                {isCopied ? '已复制' : '复制响应代码'}
+                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">注入请求代码</h4>
+                                            <textarea placeholder="粘贴发起方的加密载荷..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
+                                            <button onClick={() => handleOfferAndReply()} disabled={!remoteSDPInput} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase hover:bg-white/10 transition-all active:scale-95 disabled:opacity-30">计算响应</button>
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-4">
+                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 2: 返回响应代码</h4>
+                                            <button 
+                                              disabled={!localSDP}
+                                              onClick={() => {if(localSDP){navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}}} 
+                                              className="w-full h-14 bg-accent text-black rounded-2xl text-xs font-black uppercase active:scale-95 transition-all disabled:opacity-50"
+                                            >
+                                                <span className="material-symbols-outlined mr-2">{localSDP ? (isCopied ? 'done_all' : 'content_copy') : 'sync'}</span>
+                                                {localSDP ? (isCopied ? '响应包已复制' : '复制响应代码') : '正在生成响应包...'}
                                             </button>
+                                            <button onClick={() => setHandshakeStep(1)} className="w-full py-2 text-[10px] font-black uppercase tracking-widest text-gray-500 hover:text-white transition-colors">重新输入</button>
                                         </div>
                                     )}
                                 </div>
@@ -610,7 +608,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           )}
         </div>
 
-        {/* 聊天侧边栏 - 响应式宽度 */}
         <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[320px] xl:w-[400px] 2xl:w-[450px] glass transform transition-all duration-300 z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/90 shrink-0">
                 <div className="flex items-center gap-2.5">
@@ -627,7 +624,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         </div>
       </main>
 
-      {/* 控制栏 - 移动端避让逻辑 */}
       {connectionStatus === 'connected' && (
         <div className={`fixed bottom-4 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-1.5 lg:gap-8 p-2 lg:p-4 glass rounded-[2.5rem] lg:rounded-[3.5rem] shadow-[0_30px_60px_-15px_rgba(0,0,0,0.8)] border border-white/10 transition-all duration-300 ${isChatOpen ? 'opacity-0 pointer-events-none lg:opacity-100 lg:pointer-events-auto z-10' : 'z-[120] opacity-100'}`}>
           <div className="flex items-center gap-1 lg:gap-3 px-1.5">
@@ -707,7 +703,6 @@ const ChatBox = ({ messages, onSend, onUpload }: { messages: ChatMessage[]; onSe
           </div>
         ))}
       </div>
-      {/* 适配安全区域的输入框容器 */}
       <div className="absolute bottom-0 inset-x-0 p-4 lg:p-6 bg-gradient-to-t from-black via-black/95 to-transparent backdrop-blur-sm border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
         <form onSubmit={handleSubmit} className="flex gap-3 items-center">
           <label aria-label="上传文件" className="shrink-0 size-11 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer active:scale-95 hover:bg-white/10 transition-colors"><input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} /><span className="material-symbols-outlined text-xl">link</span></label>
