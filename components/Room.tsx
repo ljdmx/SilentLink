@@ -53,6 +53,27 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     toastTimerRef.current = window.setTimeout(() => setToast(null), 3000);
   }, []);
 
+  // 资源彻底回收函数
+  const cleanupResources = useCallback(() => {
+    peersRef.current.forEach(pc => pc.close());
+    peersRef.current.clear();
+    dataChannelsRef.current.clear();
+    rawStreamRef.current?.getTracks().forEach(t => t.stop());
+    processedStreamRef.current?.getTracks().forEach(t => t.stop());
+    blobUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+    blobUrlsRef.current.clear();
+  }, []);
+
+  const handleManualExit = useCallback(() => {
+    // 退出前尝试通知对方
+    const termMsg = JSON.stringify({ type: 'session-terminate' });
+    dataChannelsRef.current.forEach(dc => {
+      if (dc.readyState === 'open') dc.send(termMsg);
+    });
+    cleanupResources();
+    onExit();
+  }, [cleanupResources, onExit]);
+
   const addOrUpdateParticipant = useCallback((p: Participant) => {
     setParticipants(prev => {
       const exists = prev.find(u => u.id === p.id);
@@ -98,18 +119,12 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         });
       } catch (err) {
         console.error("Media init error:", err);
-        showToast("摄像头/麦克风访问失败", "error");
+        showToast("无法获取本地媒体权限", "error");
       }
     };
     initMedia();
-    return () => {
-      peersRef.current.forEach(pc => pc.close());
-      rawStreamRef.current?.getTracks().forEach(t => t.stop());
-      processedStreamRef.current?.getTracks().forEach(t => t.stop());
-      blobUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
-      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    };
-  }, [config.roomId, config.userName, config.passphrase, addOrUpdateParticipant, showToast]);
+    return () => cleanupResources();
+  }, [config.roomId, config.userName, config.passphrase, addOrUpdateParticipant, showToast, cleanupResources]);
 
   useEffect(() => {
     if (role !== 'none') setHandshakeTimer(180);
@@ -155,9 +170,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           canvas.width = lastWidth = video.videoWidth;
           canvas.height = lastHeight = video.videoHeight;
         }
-        
         const filter = filterRef.current;
-
         if (filter === PrivacyFilter.BLACK) {
           ctx.fillStyle = '#06080a';
           ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -243,16 +256,22 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
 
     pc.oniceconnectionstatechange = () => {
-      console.log(`ICE Connection State: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        showToast("对方连接断开，即将同步退出", "info");
+        setTimeout(() => {
+          if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+            handleManualExit();
+          }
+        }, 3000);
+      }
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`Connection State: ${pc.connectionState}`);
       if (pc.connectionState === 'connected') {
         setConnectionStatus('connected');
         syncMyPrivacyState(filterRef.current, isMutedRef.current);
       }
-      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
+      if (['closed'].includes(pc.connectionState)) handleManualExit();
     };
 
     if (isOffer) {
@@ -281,8 +300,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           } else if (payload.type === 'file-meta') {
             handleFileMetaReceive(payload);
           } else if (payload.type === 'file-abort') {
-            showToast("文件发送已取消", "error");
+            showToast("文件传输取消", "error");
             setFiles(prev => prev.map(f => f.id === payload.id ? { ...f, status: 'failed' } : f));
+          } else if (payload.type === 'session-terminate') {
+            showToast("对方已关闭会话", "info");
+            setTimeout(handleManualExit, 1000);
           }
         } catch (err) { console.error("Protocol error:", err); }
       } else handleFileChunkReceive(e.data);
@@ -290,12 +312,10 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   };
 
   const startAsInitiator = async () => {
-    if (!processedStreamRef.current) return showToast("正在初始化媒体设备...", "info");
+    if (!processedStreamRef.current) return showToast("等待媒体流就绪...", "info");
     setRole('initiator'); 
     setConnectionStatus('preparing');
     const pc = await setupPeerConnection('peer', true);
-    
-    // 关键修复：先注册监听器，再 setLocalDescription
     pc.onicegatheringstatechange = () => {
       if (pc.iceGatheringState === 'complete') {
         setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
@@ -303,11 +323,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         setHandshakeStep(2);
       }
     };
-
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-
-    // 如果浏览器已经收集完成，手动触发
     if (pc.iceGatheringState === 'complete') {
       setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
       setConnectionStatus('ready');
@@ -318,22 +335,16 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const handleOfferAndReply = useCallback(async (forcedOffer?: string) => {
     const offerStr = forcedOffer || remoteSDPInput;
     if (!offerStr) return;
-
-    // 如果是从 URL 自动进入，可能需要等待媒体流就绪
     if (!processedStreamRef.current) {
-        console.log("Waiting for media stream...");
         setTimeout(() => handleOfferAndReply(forcedOffer), 500);
         return;
     }
-
     if (processedOfferRef.current === offerStr) return;
-    
     processedOfferRef.current = offerStr;
     try {
       const offer = JSON.parse(atob(offerStr));
       setConnectionStatus('preparing');
       const pc = await setupPeerConnection('peer', false);
-      
       pc.onicegatheringstatechange = () => {
         if (pc.iceGatheringState === 'complete') {
           setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
@@ -341,18 +352,16 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           setHandshakeStep(2);
         }
       };
-
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-
       if (pc.iceGatheringState === 'complete') {
         setLocalSDP(btoa(JSON.stringify(pc.localDescription)));
         setConnectionStatus('ready');
         setHandshakeStep(2);
       }
     } catch (e) { 
-      showToast("解析数据包失败，请重试", "error");
+      showToast("解析请求包失败", "error");
       processedOfferRef.current = null;
     }
   }, [remoteSDPInput, showToast]);
@@ -363,10 +372,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const answer = JSON.parse(atob(remoteSDPInput));
       const pc = peersRef.current.get('peer');
       if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch (e) { 
-        showToast("握手响应无效", "error"); 
-        console.error("Finalize error:", e);
-    }
+    } catch (e) { showToast("握手响应包无效", "error"); }
   };
 
   useEffect(() => {
@@ -404,7 +410,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       if (anySent) {
         setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, type: 'text', timestamp: Date.now() }]);
       } else {
-        showToast("发送失败：加密隧道未开启", "error");
+        showToast("发送失败：隧道断开", "error");
       }
     } catch (e) { console.error(e); }
   };
@@ -413,18 +419,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     if (!encryptionKeyRef.current) return;
     const fileId = Math.random().toString(36).substring(7);
     const meta: FileMetaPayload = { type: 'file-meta', id: fileId, name: file.name, size: file.size, mimeType: file.type };
-    
     let anyOpen = false;
     dataChannelsRef.current.forEach(dc => { if(dc.readyState === 'open') { dc.send(JSON.stringify(meta)); anyOpen = true; }});
-    if (!anyOpen) return showToast("隧道未就绪", "error");
-    
+    if (!anyOpen) return showToast("未检测到连接", "error");
     setFiles(prev => [{ id: fileId, name: file.name, size: file.size, progress: 0, status: 'transferring', mimeType: file.type }, ...prev]);
-
     try {
       const buffer = await file.arrayBuffer();
       const CHUNK_SIZE = 16384;
       let offset = 0;
-
       const sendNext = async () => {
         if (offset >= buffer.byteLength) {
           const blobUrl = createAndTrackBlobUrl(new Blob([buffer], { type: file.type }));
@@ -432,42 +434,29 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'completed' } : f));
           return;
         }
-        
         try {
           const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
           const { data, iv } = await encryptBuffer(encryptionKeyRef.current!, chunk);
           const packet = new Uint8Array(iv.length + data.byteLength);
           packet.set(iv, 0); packet.set(new Uint8Array(data), iv.length);
-          
           let chunkSent = false;
           dataChannelsRef.current.forEach(dc => {
-            if (dc.readyState === 'open') {
-              if (dc.bufferedAmount < 256 * 1024) {
-                dc.send(packet);
-                chunkSent = true;
-              }
+            if (dc.readyState === 'open' && dc.bufferedAmount < 256 * 1024) {
+              dc.send(packet);
+              chunkSent = true;
             }
           });
-
-          if (!chunkSent) {
-            setTimeout(sendNext, 50); 
-            return;
-          }
-
+          if (!chunkSent) { setTimeout(sendNext, 50); return; }
           offset += CHUNK_SIZE;
           setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.min(100, Math.round((offset/file.size)*100)) } : f));
           setTimeout(sendNext, 1);
         } catch (innerErr) {
-          console.error("Chunk failed:", innerErr);
           dataChannelsRef.current.forEach(dc => dc.readyState === 'open' && dc.send(JSON.stringify({type: 'file-abort', id: fileId})));
           setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'failed' } : f));
         }
       };
       sendNext();
-    } catch (err) {
-      console.error("File error:", err);
-      setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'failed' } : f));
-    }
+    } catch (err) { setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'failed' } : f)); }
   };
 
   const receivingRef = useRef<ReceivingFileState | null>(null);
@@ -490,7 +479,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         receivingRef.current = null;
       }
     } catch (err) {
-      console.error("Decrypt chunk failed:", err);
       setFiles(prev => prev.map(f => f.id === s.id ? { ...f, status: 'failed' } : f));
       receivingRef.current = null;
     }
@@ -526,7 +514,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             </div>
           </div>
         </div>
-        <button onClick={onExit} className="h-7 lg:h-8 px-3 lg:px-4 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 text-[8px] lg:text-[10px] font-black uppercase tracking-widest transition-all">物理退出</button>
+        <button onClick={handleManualExit} className="h-7 lg:h-8 px-3 lg:px-4 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 text-[8px] lg:text-[10px] font-black uppercase tracking-widest transition-all">物理退出</button>
       </header>
 
       <main className="flex-1 flex overflow-hidden relative p-2 pt-0 gap-2">
@@ -537,7 +525,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                     <div className="text-center space-y-8 max-w-2xl w-full px-4">
                         <div className="space-y-3">
                             <h3 className="text-3xl lg:text-5xl font-black text-white tracking-tighter uppercase italic leading-none">安全隧道待命中</h3>
-                            <p className="text-gray-500 text-[9px] lg:text-[10px] font-black uppercase tracking-[0.4em]">请选择您的节点角色以启动握手</p>
+                            <p className="text-gray-500 text-[9px] lg:text-[10px] font-black uppercase tracking-[0.4em]">请启动端对端握手</p>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 lg:gap-6 w-full max-w-3xl">
                             <button onClick={startAsInitiator} className="group flex flex-col items-center gap-4 p-8 glass rounded-[2rem] border-primary/10 hover:border-primary/40 transition-all shadow-xl active:scale-95">
@@ -564,16 +552,16 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                     {handshakeStep === 2 && (
                                         <div className="space-y-8">
                                             <div className="space-y-4">
-                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 1: 复制并发送请求包</h4>
+                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 1: 复制并发送请求链接</h4>
                                                 <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-primary/10 border-2 border-primary/20 hover:border-primary text-primary rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all active:scale-95">
                                                     <span className="material-symbols-outlined text-xl">{isCopied ? 'done_all' : 'content_copy'}</span>
                                                     <span>{isCopied ? '链接已复制' : '复制安全请求链接'}</span>
                                                 </button>
                                             </div>
                                             <div className="space-y-4">
-                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 2: 粘贴对方返回的响应包</h4>
+                                                <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">STEP 2: 粘贴对方响应代码</h4>
                                                 <div className="relative">
-                                                    <textarea placeholder="粘贴对方生成的响应代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
+                                                    <textarea placeholder="粘贴响应代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
                                                     <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-3 right-3 h-10 px-6 bg-accent text-black rounded-xl text-[10px] font-black uppercase active:scale-95 disabled:opacity-20 transition-all">建立隧道</button>
                                                 </div>
                                             </div>
@@ -583,15 +571,15 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                             ) : (
                                 <div className="space-y-8">
                                     <div className="space-y-4">
-                                        <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">注入收到的请求包</h4>
-                                        <textarea placeholder="粘贴发起方提供的请求代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
-                                        <button onClick={() => handleOfferAndReply()} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase hover:bg-white/10 transition-all active:scale-95">计算响应包</button>
+                                        <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">注入请求包</h4>
+                                        <textarea placeholder="粘贴请求代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-24 bg-black/40 border border-white/5 rounded-2xl p-4 text-[10px] font-mono text-accent outline-none resize-none placeholder:text-gray-700" />
+                                        <button onClick={() => handleOfferAndReply()} className="w-full h-14 bg-white/5 border border-white/10 text-white rounded-2xl text-xs font-black uppercase hover:bg-white/10 transition-all active:scale-95">计算响应代码</button>
                                     </div>
                                     {handshakeStep === 2 && (
                                         <div className="space-y-4">
-                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">复制并返回响应</h4>
+                                            <h4 className="text-[10px] font-black uppercase tracking-widest text-left text-gray-400">返回响应代码</h4>
                                             <button onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-accent text-black rounded-2xl text-xs font-black uppercase active:scale-95 transition-all">
-                                                {isCopied ? '响应包已复制' : '复制响应代码并返回对方'}
+                                                {isCopied ? '已复制' : '复制响应代码'}
                                             </button>
                                         </div>
                                     )}
@@ -609,12 +597,12 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 ) : (
                   <div className="w-full h-full flex flex-col items-center justify-center space-y-6 opacity-30">
                     <div className="size-12 lg:size-16 rounded-full border-4 border-primary/10 border-t-primary animate-spin"></div>
-                    <p className="text-[10px] lg:text-xs font-black uppercase tracking-[0.4em] text-white">正在加密数据链路...</p>
+                    <p className="text-[10px] lg:text-xs font-black uppercase tracking-[0.4em] text-white font-mono">ENCRYPTING LINK...</p>
                   </div>
                 )}
               </div>
               {showLocalPreview && localParticipant && (
-                <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-8 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-95">
+                <div className="absolute bottom-28 lg:bottom-10 left-4 lg:left-8 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-95">
                   <VideoCard participant={localParticipant} filter={currentFilter} />
                 </div>
               )}
@@ -622,11 +610,12 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           )}
         </div>
 
-        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[min(450px,30vw)] glass transform transition-all duration-300 z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
+        {/* 聊天侧边栏 - 响应式宽度 */}
+        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[320px] xl:w-[400px] 2xl:w-[450px] glass transform transition-all duration-300 z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/90 shrink-0">
                 <div className="flex items-center gap-2.5">
-                    <span className="size-2 rounded-full bg-accent animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.4)]"></span>
-                    <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-white/90">加密隧道</h3>
+                    <span className="size-2 rounded-full bg-accent animate-pulse"></span>
+                    <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-white/90">E2EE TUNNEL</h3>
                 </div>
                 <button onClick={() => setIsChatOpen(false)} aria-label="关闭聊天" className="size-10 rounded-full hover:bg-white/5 flex items-center justify-center text-gray-500 transition-all active:scale-90">
                     <span className="material-symbols-outlined text-2xl">close</span>
@@ -638,8 +627,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         </div>
       </main>
 
+      {/* 控制栏 - 移动端避让逻辑 */}
       {connectionStatus === 'connected' && (
-        <div className={`fixed bottom-4 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-1.5 lg:gap-8 p-2 lg:p-4 glass rounded-[2.5rem] lg:rounded-[3.5rem] shadow-[0_30px_60px_-15px_rgba(0,0,0,0.8)] border border-white/10 animate-in slide-in-from-bottom-8 ${isChatOpen ? 'z-[10] opacity-0 lg:opacity-100 pointer-events-none lg:pointer-events-auto' : 'z-[120]'}`}>
+        <div className={`fixed bottom-4 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-1.5 lg:gap-8 p-2 lg:p-4 glass rounded-[2.5rem] lg:rounded-[3.5rem] shadow-[0_30px_60px_-15px_rgba(0,0,0,0.8)] border border-white/10 transition-all duration-300 ${isChatOpen ? 'opacity-0 pointer-events-none lg:opacity-100 lg:pointer-events-auto z-10' : 'z-[120] opacity-100'}`}>
           <div className="flex items-center gap-1 lg:gap-3 px-1.5">
             <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={() => setIsMuted(!isMuted)} danger={isMuted} label="静音" />
             <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={() => setCurrentFilter(prev => prev === PrivacyFilter.MOSAIC ? PrivacyFilter.NONE : PrivacyFilter.MOSAIC)} label="马赛克" />
@@ -672,7 +662,7 @@ const ControlBtn = ({ icon, active, onClick, danger, label, badge }: { icon: str
       <span className="material-symbols-outlined text-[20px] lg:text-[26px]">{icon}</span>
       {badge && <span className="absolute top-0 right-0 size-2 bg-primary rounded-full ring-2 ring-black"></span>}
     </button>
-    <span className="text-[7px] lg:text-[10px] font-black uppercase text-gray-600 hidden md:block">{label}</span>
+    <span className="text-[7px] lg:text-[10px] font-black uppercase text-gray-600 hidden md:block tracking-widest">{label}</span>
   </div>
 );
 
@@ -684,11 +674,11 @@ const ChatBox = ({ messages, onSend, onUpload }: { messages: ChatMessage[]; onSe
   
   return (
     <div className="flex flex-col h-full bg-[#080a0c]">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 pb-32 lg:pb-32 custom-scrollbar">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4 pb-28 lg:pb-32 custom-scrollbar">
         {messages.length === 0 && (
           <div className="h-full flex flex-col items-center justify-center text-center opacity-20 py-20 grayscale">
             <span className="material-symbols-outlined text-5xl mb-4">vpn_lock</span>
-            <p className="text-[11px] font-black uppercase tracking-[0.4em]">端对端隧道已建立</p>
+            <p className="text-[11px] font-black uppercase tracking-[0.4em]">安全端对端隧道已建立</p>
           </div>
         )}
         {messages.map(m => (
@@ -706,7 +696,7 @@ const ChatBox = ({ messages, onSend, onUpload }: { messages: ChatMessage[]; onSe
                         <span className="material-symbols-outlined text-primary text-xl">link</span>
                         <div className="flex flex-col min-w-0">
                           <span className="text-[11px] font-bold truncate text-white">{m.fileName}</span>
-                          <span className="text-[8px] opacity-30 uppercase tracking-tighter">Verified Binary</span>
+                          <span className="text-[8px] opacity-30 uppercase tracking-tighter">SECURE BINARY</span>
                         </div>
                       </div>
                     )}
@@ -717,10 +707,11 @@ const ChatBox = ({ messages, onSend, onUpload }: { messages: ChatMessage[]; onSe
           </div>
         ))}
       </div>
+      {/* 适配安全区域的输入框容器 */}
       <div className="absolute bottom-0 inset-x-0 p-4 lg:p-6 bg-gradient-to-t from-black via-black/95 to-transparent backdrop-blur-sm border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
         <form onSubmit={handleSubmit} className="flex gap-3 items-center">
           <label aria-label="上传文件" className="shrink-0 size-11 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer active:scale-95 hover:bg-white/10 transition-colors"><input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} /><span className="material-symbols-outlined text-xl">link</span></label>
-          <input className="flex-1 h-11 bg-white/5 border border-white/10 rounded-xl px-4 text-[13px] text-white focus:outline-none focus:border-primary/50 transition-all placeholder:text-gray-600" placeholder="加密隧道中..." value={text} onChange={(e) => setText(e.target.value)} />
+          <input className="flex-1 h-11 bg-white/5 border border-white/10 rounded-xl px-4 text-[13px] text-white focus:outline-none focus:border-primary/50 transition-all placeholder:text-gray-600" placeholder="发送加密消息..." value={text} onChange={(e) => setText(e.target.value)} />
           <button type="submit" aria-label="发送消息" disabled={!text.trim()} className="shrink-0 size-11 bg-primary text-white rounded-xl flex items-center justify-center disabled:opacity-20 active:scale-95 shadow-lg shadow-primary/30 transition-all"><span className="material-symbols-outlined text-xl">arrow_upward</span></button>
         </form>
       </div>
