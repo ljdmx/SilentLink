@@ -22,13 +22,13 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [isRemoteHidden, setIsRemoteHidden] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
   
-  // Fix: Define localParticipant and remoteParticipant derived state variables
+  // Derived state for easy access in JSX
   const localParticipant = participants.find(p => p.isLocal);
   const remoteParticipant = participants.find(p => !p.isLocal);
 
-  const [role, setRole] = useState<HandshakeRole>('none');
+  const [role, setRole] = useState<HandshakeRole>(config.initialOffer ? 'receiver' : 'none');
   const [localSDP, setLocalSDP] = useState('');
-  const [remoteSDPInput, setRemoteSDPInput] = useState('');
+  const [remoteSDPInput, setRemoteSDPInput] = useState(config.initialOffer || '');
   const [connectionStatus, setConnectionStatus] = useState<'idle' | 'preparing' | 'ready' | 'connected'>('idle');
   const [handshakeStep, setHandshakeStep] = useState(1);
   const [handshakeTimer, setHandshakeTimer] = useState(180);
@@ -46,7 +46,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     filterRef.current = currentFilter;
   }, [currentFilter]);
 
-  // 握手倒计时逻辑
+  // Handshake timer logic
   useEffect(() => {
     let timer: number;
     if (role !== 'none' && connectionStatus !== 'connected' && handshakeTimer > 0) {
@@ -56,6 +56,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     }
     return () => clearInterval(timer);
   }, [role, connectionStatus, handshakeTimer]);
+
+  // Automatic Handshake execution for Receivers arriving via Link
+  useEffect(() => {
+    if (config.initialOffer && role === 'receiver' && connectionStatus === 'idle') {
+      console.log("Detecting initial offer, starting auto-reply...");
+      handleOfferAndReply();
+    }
+  }, [config.initialOffer]);
 
   const addParticipant = useCallback((p: Participant) => {
     setParticipants(prev => {
@@ -72,7 +80,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
-  // 高度模糊的马赛克滤镜引擎
+  // Filter engine for Mosaic/Blur
   useEffect(() => {
     let animationFrame: number;
     const canvas = filterCanvasRef.current;
@@ -91,15 +99,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           ctx.fillStyle = '#06080a';
           ctx.fillRect(0, 0, canvas.width, canvas.height);
         } else if (filter === PrivacyFilter.MOSAIC) {
-          // 极小比例以实现超大像素
           const scale = 0.02; 
           const w = canvas.width * scale;
           const h = canvas.height * scale;
-          
           ctx.imageSmoothingEnabled = false;
-          // 先缩小
           ctx.drawImage(video, 0, 0, w, h);
-          // 再放大并叠加模糊效果 (高度模糊)
           ctx.filter = 'blur(12px)'; 
           ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
           ctx.filter = 'none';
@@ -153,22 +157,39 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   }, [config.roomId, config.userName, config.passphrase, addParticipant]);
 
   const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    // Enhanced STUN configuration for better NAT traversal
+    const pc = new RTCPeerConnection({ 
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+      ],
+      iceCandidatePoolSize: 10
+    });
+    
     peersRef.current.set(remoteId, pc);
     processedStreamRef.current?.getTracks().forEach(track => { 
       if (processedStreamRef.current) pc.addTrack(track, processedStreamRef.current); 
     });
+    
     pc.ontrack = (e) => { 
       addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
     };
+    
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected') setConnectionStatus('connected');
       if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
     };
+    
     if (isOffer) {
       const dc = pc.createDataChannel('secure-chat-tunnel', { ordered: true });
       setupDataChannel(remoteId, dc);
-    } else { pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); }
+    } else { 
+      pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); 
+    }
+    
     return pc;
   };
 
@@ -210,9 +231,10 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   };
 
   const handleOfferAndReply = async () => {
-    if (!remoteSDPInput) return;
+    const offerToProcess = config.initialOffer || remoteSDPInput;
+    if (!offerToProcess) return;
     try {
-      const decoded = JSON.parse(atob(remoteSDPInput));
+      const decoded = JSON.parse(atob(offerToProcess));
       setConnectionStatus('preparing');
       const pc = await setupPeerConnection('peer', false);
       await pc.setRemoteDescription(new RTCSessionDescription(decoded));
@@ -223,7 +245,10 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           setLocalSDP(btoa(JSON.stringify(pc.localDescription))); setConnectionStatus('ready'); setHandshakeStep(2);
         }
       };
-    } catch (e) { alert("请求解析失败，请检查代码包"); }
+    } catch (e) { 
+        console.error("Handshake auto-reply failed", e);
+        if (!config.initialOffer) alert("请求解析失败，请检查代码包"); 
+    }
   };
 
   const getInviteLink = () => {

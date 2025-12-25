@@ -52,4 +52,5 @@ export interface RoomConfig {
   recordingProtection: boolean;
   ephemeralSession: boolean;
   defaultFilter: PrivacyFilter;
+  initialOffer?: string; // Add this for auto-handshake
 }

@@ -17,6 +17,7 @@ const App: React.FC = () => {
       const params = new URLSearchParams(hash.substring(1));
       const roomId = params.get('room') || 'SECURE_P2P';
       const passphrase = params.get('pass') || 'SECURE_KEY';
+      const offer = params.get('offer') || '';
       
       const config: RoomConfig = {
         roomId,
@@ -25,6 +26,7 @@ const App: React.FC = () => {
         recordingProtection: true,
         ephemeralSession: true,
         defaultFilter: PrivacyFilter.NONE,
+        initialOffer: offer,
       };
       
       setRoomConfig(config);
