@@ -42,16 +42,22 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const filterCanvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
   const filterRef = useRef<PrivacyFilter>(config.defaultFilter);
 
+  // 同步滤镜状态到 Ref 供 Canvas 渲染循环使用
   useEffect(() => {
     filterRef.current = currentFilter;
   }, [currentFilter]);
 
+  // 静音状态同步到流轨道
+  useEffect(() => {
+    if (rawStreamRef.current) {
+      rawStreamRef.current.getAudioTracks().forEach(t => t.enabled = !isMuted);
+    }
+  }, [isMuted]);
+
   useEffect(() => {
     let timer: number;
     if (role !== 'none' && connectionStatus !== 'connected' && handshakeTimer > 0) {
-      timer = window.setInterval(() => {
-        setHandshakeTimer(prev => prev - 1);
-      }, 1000);
+      timer = window.setInterval(() => setHandshakeTimer(prev => prev - 1), 1000);
     }
     return () => clearInterval(timer);
   }, [role, connectionStatus, handshakeTimer]);
@@ -71,7 +77,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
-  // 高级隐私滤镜引擎：直接修改发送出去的流
+  // 核心隐私渲染引擎：直接处理并输出视频流
   useEffect(() => {
     let animationFrame: number;
     const canvas = filterCanvasRef.current;
@@ -91,11 +97,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           ctx.fillRect(0, 0, canvas.width, canvas.height);
         } else if (filter === PrivacyFilter.MOSAIC) {
           const scale = 0.02; 
-          const w = canvas.width * scale;
-          const h = canvas.height * scale;
+          const w = Math.max(1, canvas.width * scale);
+          const h = Math.max(1, canvas.height * scale);
           ctx.imageSmoothingEnabled = false;
           ctx.drawImage(video, 0, 0, w, h);
-          ctx.filter = 'blur(12px)'; 
+          ctx.filter = 'blur(10px)'; 
           ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
           ctx.filter = 'none';
         } else if (filter === PrivacyFilter.BLUR) {
@@ -110,11 +116,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
 
     const interval = setInterval(() => {
-        if (rawStreamRef.current && video.srcObject !== rawStreamRef.current) {
-            video.srcObject = rawStreamRef.current;
-            video.play().then(() => render()).catch(e => console.error("Filter engine failed", e));
-        }
-    }, 1000);
+      if (rawStreamRef.current && video.srcObject !== rawStreamRef.current) {
+        video.srcObject = rawStreamRef.current;
+        video.play().then(() => render()).catch(e => console.error("Filter engine failed", e));
+      }
+    }, 500);
 
     return () => {
       cancelAnimationFrame(animationFrame);
@@ -132,12 +138,12 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:stun3.l.google.com:19302' },
         { urls: 'stun:stun4.l.google.com:19302' }
-      ],
-      iceCandidatePoolSize: 10
+      ]
     });
 
     peersRef.current.set(remoteId, pc);
 
+    // 将已处理（脱敏）的轨道推送到 Peer
     processedStreamRef.current?.getTracks().forEach(track => { 
       if (processedStreamRef.current) pc.addTrack(track, processedStreamRef.current); 
     });
@@ -147,7 +153,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
 
     pc.onconnectionstatechange = () => {
-      console.log("Connection state:", pc.connectionState);
       if (pc.connectionState === 'connected') setConnectionStatus('connected');
       if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
     };
@@ -202,7 +207,10 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         rawStreamRef.current = stream;
         const canvasStream = (filterCanvasRef.current as any).captureStream(30);
         const audioTrack = stream.getAudioTracks()[0];
-        if (audioTrack) canvasStream.addTrack(audioTrack);
+        if (audioTrack) {
+          audioTrack.enabled = !isMuted;
+          canvasStream.addTrack(audioTrack);
+        }
         processedStreamRef.current = canvasStream;
         addParticipant({ id: 'local', name: config.userName, isLocal: true, isHost: true, audioEnabled: true, videoEnabled: true, stream: canvasStream });
       } catch (err) { console.error("Media init error:", err); }
@@ -248,7 +256,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const decoded = JSON.parse(atob(remoteSDPInput));
       const pc = peersRef.current.get('peer');
       if (pc) await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-    } catch (e) { alert("响应包格式错误"); }
+    } catch (e) { alert("响应包解析失败"); }
   };
 
   const getInviteLink = () => {
@@ -274,32 +282,37 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     const metaPayload = { type: 'file-meta', id: fileId, name: file.name, size: file.size, mimeType: file.type };
     
     setFiles(prev => [{ id: fileId, name: file.name, size: file.size, progress: 0, status: 'transferring', mimeType: file.type }, ...prev]);
-    
-    dataChannelsRef.current.forEach(dc => { 
-      if (dc.readyState === 'open') dc.send(JSON.stringify(metaPayload)); 
-    });
+    dataChannelsRef.current.forEach(dc => { if (dc.readyState === 'open') dc.send(JSON.stringify(metaPayload)); });
 
-    const reader = file.stream().getReader();
+    const CHUNK_SIZE = 16384; // 16KB 稳定分片
+    const buffer = await file.arrayBuffer();
     let offset = 0;
-    const chunks: ArrayBuffer[] = [];
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value.buffer);
-      const { data, iv } = await encryptBuffer(encryptionKeyRef.current, value.buffer);
+    const sendChunk = async () => {
+      if (offset >= buffer.byteLength) {
+        const blobUrl = URL.createObjectURL(new Blob([buffer], { type: file.type }));
+        setMessages(prev => [...prev, { id: fileId, senderId: 'local', senderName: config.userName, blobUrl, type: file.type.startsWith('image/') ? 'image' : 'file', fileName: file.name, timestamp: Date.now() }]);
+        setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'completed' } : f));
+        return;
+      }
+
+      const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+      const { data, iv } = await encryptBuffer(encryptionKeyRef.current!, chunk);
       const packet = new Uint8Array(iv.length + data.byteLength);
       packet.set(iv, 0); 
       packet.set(new Uint8Array(data), iv.length);
-      
-      dataChannelsRef.current.forEach(dc => { if (dc.readyState === 'open') dc.send(packet); });
-      offset += value.byteLength;
-      setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.round((offset / file.size) * 100) } : f));
-    }
 
-    const blobUrl = URL.createObjectURL(new Blob(chunks, { type: file.type }));
-    setMessages(prev => [...prev, { id: fileId, senderId: 'local', senderName: config.userName, blobUrl, type: file.type.startsWith('image/') ? 'image' : 'file', fileName: file.name, timestamp: Date.now() }]);
-    setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'completed' } : f));
+      dataChannelsRef.current.forEach(dc => {
+        if (dc.readyState === 'open') {
+          if (dc.bufferedAmount < dc.bufferedAmountLowThreshold || 1024 * 1024) dc.send(packet);
+        }
+      });
+
+      offset += CHUNK_SIZE;
+      setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.min(100, Math.round((offset / file.size) * 100)) } : f));
+      setTimeout(sendChunk, 5); // 稍微延迟防止拥塞
+    };
+    sendChunk();
   };
 
   const receivingFileRef = useRef<{ id: string; name: string; size: number; received: number; chunks: ArrayBuffer[]; mimeType?: string } | null>(null);
@@ -318,7 +331,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       state.chunks.push(decryptedChunk); 
       state.received += decryptedChunk.byteLength;
       
-      setFiles(prev => prev.map(f => f.id === state.id ? { ...f, progress: Math.round((state.received / state.size) * 100) } : f));
+      setFiles(prev => prev.map(f => f.id === state.id ? { ...f, progress: Math.min(100, Math.round((state.received / state.size) * 100)) } : f));
       
       if (state.received >= state.size) {
         const blobUrl = URL.createObjectURL(new Blob(state.chunks, { type: state.mimeType }));
@@ -326,25 +339,21 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
         receivingFileRef.current = null;
       }
-    } catch (e) { console.error("File chunk decrypt failed", e); }
+    } catch (e) { console.error("Decryption error in chunk", e); }
   };
 
-  const toggleMyMic = () => {
-    const t = rawStreamRef.current?.getAudioTracks()[0];
-    if (t) { t.enabled = !t.enabled; setIsMuted(!t.enabled); }
-  };
-
-  const toggleMyPrivacy = () => {
+  // Add missing toggle functions for privacy filters
+  const toggleMyPrivacy = useCallback(() => {
     setCurrentFilter(prev => prev === PrivacyFilter.MOSAIC ? PrivacyFilter.NONE : PrivacyFilter.MOSAIC);
-  };
+  }, []);
 
-  const toggleMyVideo = () => {
+  const toggleMyVideo = useCallback(() => {
     setCurrentFilter(prev => prev === PrivacyFilter.BLACK ? PrivacyFilter.NONE : PrivacyFilter.BLACK);
-  };
+  }, []);
 
   return (
     <div className="flex flex-col h-[100dvh] bg-background overflow-hidden relative font-sans">
-      <header className="h-12 lg:h-14 shrink-0 flex items-center justify-between px-3 lg:px-6 glass z-[60] m-2 rounded-xl lg:rounded-2xl border-none">
+      <header className="h-12 lg:h-14 shrink-0 flex items-center justify-between px-3 lg:px-6 glass z-[60] m-2 rounded-xl border-none">
         <div className="flex items-center gap-2 lg:gap-3">
           <div className="size-7 lg:size-8 bg-primary/10 rounded-lg flex items-center justify-center border border-primary/20">
             <span className="material-symbols-outlined text-primary text-xs lg:text-sm fill-1">verified_user</span>
@@ -365,17 +374,17 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           {connectionStatus !== 'connected' ? (
             <div className="flex-1 flex flex-col items-center justify-center p-4 lg:p-12 space-y-6 animate-in fade-in duration-700 overflow-y-auto">
                 {role === 'none' ? (
-                    <div className="text-center space-y-8 lg:space-y-12 max-w-2xl w-full px-4">
+                    <div className="text-center space-y-8 max-w-2xl w-full px-4">
                         <div className="space-y-3">
                             <h3 className="text-3xl lg:text-5xl font-black text-white tracking-tighter uppercase italic leading-none">节点待命中</h3>
                             <p className="text-gray-500 text-[9px] lg:text-[10px] font-black uppercase tracking-[0.4em]">请选择您的连接策略</p>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 lg:gap-6 w-full max-w-3xl">
-                            <button onClick={startAsInitiator} className="group flex flex-col items-center gap-4 lg:gap-8 p-6 lg:p-14 glass rounded-[2rem] lg:rounded-[3rem] border-primary/10 hover:border-primary/40 transition-all shadow-xl active:scale-95">
+                            <button onClick={startAsInitiator} className="group flex flex-col items-center gap-4 p-8 glass rounded-[2rem] border-primary/10 hover:border-primary/40 transition-all shadow-xl active:scale-95">
                                 <span className="material-symbols-outlined text-4xl lg:text-5xl text-primary animate-pulse">send_time_extension</span>
                                 <h4 className="text-sm lg:text-xl font-black text-white uppercase tracking-widest">作为发起方</h4>
                             </button>
-                            <button onClick={() => setRole('receiver')} className="group flex flex-col items-center gap-4 lg:gap-8 p-6 lg:p-14 glass rounded-[2rem] lg:rounded-[3rem] border-accent/10 hover:border-accent/40 transition-all shadow-xl active:scale-95">
+                            <button onClick={() => setRole('receiver')} className="group flex flex-col items-center gap-4 p-8 glass rounded-[2rem] border-accent/10 hover:border-accent/40 transition-all shadow-xl active:scale-95">
                                 <span className="material-symbols-outlined text-4xl lg:text-5xl text-accent">hail</span>
                                 <h4 className="text-sm lg:text-xl font-black text-white uppercase tracking-widest">作为接收方</h4>
                             </button>
@@ -401,7 +410,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                         <div className="space-y-8">
                                             <div className="space-y-4">
                                                 <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em] text-left">STEP 1: 发送魔术链接</h4>
-                                                <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 lg:h-18 bg-primary/10 border-2 border-primary/20 hover:border-primary text-primary rounded-2xl lg:rounded-[1.5rem] font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all active:scale-95">
+                                                <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-primary/10 border-2 border-primary/20 hover:border-primary text-primary rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all active:scale-95">
                                                     <span className="material-symbols-outlined text-xl">{isCopied ? 'done_all' : 'content_copy'}</span>
                                                     <span className="text-sm">{isCopied ? '已准备好发送' : '复制连接请求'}</span>
                                                 </button>
@@ -427,17 +436,10 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                         <div className="space-y-4">
                                             <h4 className="text-[10px] lg:text-[11px] font-black text-white uppercase tracking-[0.2em]">将响应代码传回对方</h4>
                                             <button onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-14 bg-accent text-black rounded-2xl text-xs font-black uppercase tracking-widest active:scale-95 transition-all">
-                                                {isCopied ? '响应已复制到剪贴板' : '复制我的响应代码'}
+                                                {isCopied ? '响应已复制' : '复制我的响应代码'}
                                             </button>
                                         </div>
                                     )}
-                                </div>
-                            )}
-
-                            {handshakeTimer === 0 && (
-                                <div className="mt-8 pt-8 border-t border-white/5 text-center space-y-4 animate-in fade-in slide-in-from-bottom-2">
-                                    <p className="text-[10px] text-red-400 font-bold uppercase tracking-widest">握手窗口已关闭</p>
-                                    <button onClick={() => window.location.reload()} className="px-6 py-2 bg-white/5 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-gray-400 hover:text-white transition-colors">重新同步节点</button>
                                 </div>
                             )}
                         </div>
@@ -457,9 +459,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 )}
               </div>
               
-              {/* 本地视频预览：左下角，避让底部栏 */}
               {showLocalPreview && localParticipant && (
-                <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-10 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-95 duration-300">
+                <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-8 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-95">
                   <VideoCard participant={localParticipant} filter={currentFilter} />
                 </div>
               )}
@@ -467,11 +468,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           )}
         </div>
 
-        {/* 侧边聊天栏 */}
-        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[420px] glass transform transition-all duration-300 ease-[cubic-bezier(0.23,1,0.32,1)] z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
+        {/* 聊天侧边栏 - PC端响应式宽度，移动端Overlay */}
+        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[25vw] lg:min-w-[380px] lg:max-w-[500px] glass transform transition-all duration-300 ease-[cubic-bezier(0.23,1,0.32,1)] z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/90 shrink-0">
                 <div className="flex items-center gap-2.5">
-                    <span className="size-2 rounded-full bg-accent animate-pulse shadow-[0_0_8px_#22c55e]"></span>
+                    <span className="size-2 rounded-full bg-accent animate-pulse"></span>
                     <h3 className="text-[11px] font-black uppercase tracking-[0.2em] text-white/90">加密通讯隧道</h3>
                 </div>
                 <button onClick={() => setIsChatOpen(false)} className="size-10 rounded-full hover:bg-white/5 flex items-center justify-center text-gray-500 transition-all active:scale-90">
@@ -479,18 +480,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 </button>
              </div>
              <div className="flex-1 overflow-hidden bg-[#0a0c0e] flex flex-col relative">
-                <ChatBox messages={messages} onSend={sendMessage} userName={config.userName} onUpload={handleFileUpload} />
+                {/* 注意：移动端时增加 padding-bottom 避开底栏输入框以外的区域 */}
+                <ChatBox messages={messages} onSend={sendMessage} onUpload={handleFileUpload} isChatOpen={isChatOpen} />
              </div>
         </div>
       </main>
 
-      {/* 控制底栏 */}
       {connectionStatus === 'connected' && (
         <div className="fixed bottom-4 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-1.5 lg:gap-8 p-2 lg:p-4 glass rounded-[2.5rem] lg:rounded-[3.5rem] z-[120] shadow-[0_30px_60px_-15px_rgba(0,0,0,0.8)] border border-white/10 animate-in slide-in-from-bottom-8">
           <div className="flex items-center gap-1 lg:gap-3 px-1.5">
-            <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={toggleMyMic} danger={isMuted} label="静音" />
+            <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={() => setIsMuted(!isMuted)} danger={isMuted} label="静音" />
             <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={toggleMyPrivacy} label="马赛克" />
-            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏闭画面" />
+            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏蔽画面" />
             <ControlBtn icon={showLocalPreview ? 'picture_in_picture' : 'picture_in_picture_alt'} active={showLocalPreview} onClick={() => setShowLocalPreview(!showLocalPreview)} label="预览开关" />
           </div>
           <div className="w-px h-8 bg-white/10 mx-1"></div>
@@ -521,57 +522,47 @@ const ControlBtn = ({ icon, active, onClick, danger, label, badge }: { icon: str
   </div>
 );
 
-const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessage[]; onSend: (t: string) => void; userName: string; onUpload: (f: File) => void }) => {
+const ChatBox = ({ messages, onSend, onUpload, isChatOpen }: { messages: ChatMessage[]; onSend: (t: string) => void; onUpload: (f: File) => void, isChatOpen: boolean }) => {
   const [text, setText] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   
   useEffect(() => { 
     if (scrollRef.current) {
-      scrollRef.current.scrollTo({
-        top: scrollRef.current.scrollHeight,
-        behavior: 'smooth'
-      });
+      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
     }
   }, [messages]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (text.trim()) {
-      onSend(text);
-      setText('');
-      if (window.innerWidth > 1024) inputRef.current?.focus();
-    }
+    if (text.trim()) { onSend(text); setText(''); }
   };
   
   return (
     <div className="flex flex-col h-full relative overflow-hidden bg-[#080a0c]">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6 custom-scrollbar pb-36 lg:pb-10">
+      {/* 底部增加 pb-40 确保内容不被移动端输入框和底栏遮挡 */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-6 custom-scrollbar pb-36 lg:pb-32">
         {messages.length === 0 && (
-            <div className="h-full flex flex-col items-center justify-center text-center opacity-20 space-y-4 py-20 grayscale">
-                <div className="size-20 rounded-full bg-white/5 flex items-center justify-center border border-white/10">
-                    <span className="material-symbols-outlined text-5xl">vpn_lock</span>
-                </div>
-                <div className="space-y-1 px-10">
-                    <p className="text-[11px] font-black uppercase tracking-[0.4em]">端对端加密通道</p>
-                    <p className="text-[9px] font-medium leading-relaxed">消息仅通过 P2P 隧道传输，关闭即物理抹除</p>
-                </div>
+            <div className="h-full flex flex-col items-center justify-center text-center opacity-20 py-20 grayscale">
+                <span className="material-symbols-outlined text-5xl mb-4">vpn_lock</span>
+                <p className="text-[11px] font-black uppercase tracking-[0.4em]">端对端加密通道</p>
+                <p className="text-[9px] font-medium leading-relaxed mt-1">对话实时销毁中</p>
             </div>
         )}
         {messages.map(m => (
-          <div key={m.id} className={`flex flex-col ${m.senderId === 'local' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-4`}>
+          <div key={m.id} className={`flex flex-col ${m.senderId === 'local' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-2`}>
              <div className="flex items-center gap-2 mb-1.5 px-1.5">
                 <span className={`text-[9px] font-black uppercase tracking-widest ${m.senderId === 'local' ? 'text-primary' : 'text-gray-500'}`}>{m.senderName}</span>
                 <span className="text-[7px] font-mono text-gray-700">{new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
              </div>
-             <div className={`rounded-2xl max-w-[90%] lg:max-w-[85%] overflow-hidden shadow-2xl transition-all hover:scale-[1.01] ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-[#1a1f26] border border-white/10 text-gray-200 rounded-tl-none'}`}>
-               {m.type === 'text' && <p className="px-4 py-3 lg:px-5 lg:py-3.5 text-[13px] lg:text-[14px] leading-relaxed break-words font-medium">{m.text}</p>}
+             <div className={`rounded-2xl max-w-[90%] overflow-hidden shadow-2xl transition-all ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-[#1a1f26] border border-white/10 text-gray-200 rounded-tl-none'}`}>
+               {m.type === 'text' && <p className="px-4 py-3 text-[13px] leading-relaxed break-words font-medium">{m.text}</p>}
                {m.blobUrl && (
-                 <div className="relative group min-w-[180px]">
+                 <div className="relative group min-w-[200px]">
                     {m.type === 'image' ? (
-                        <img src={m.blobUrl} className="w-full h-auto max-h-[500px] object-cover" loading="lazy" />
+                        <img src={m.blobUrl} className="w-full h-auto max-h-[500px] object-cover" />
                     ) : (
-                        <div className="p-4 lg:p-5 flex items-center gap-4 bg-black/20">
+                        <div className="p-4 flex items-center gap-4 bg-black/20">
                             <div className="size-11 rounded-xl bg-white/5 flex items-center justify-center border border-white/10 text-primary">
                                 <span className="material-symbols-outlined text-xl">link</span>
                             </div>
@@ -581,7 +572,7 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
                             </div>
                         </div>
                     )}
-                    <a href={m.blobUrl} download={m.fileName} className="absolute bottom-2 right-2 size-10 bg-black/80 rounded-xl flex items-center justify-center opacity-0 group-hover:opacity-100 lg:opacity-0 transition-opacity backdrop-blur-md border border-white/10 active:scale-90 text-white">
+                    <a href={m.blobUrl} download={m.fileName} className="absolute bottom-2 right-2 size-10 bg-black/80 rounded-xl flex items-center justify-center text-white border border-white/10 hover:bg-primary transition-colors">
                         <span className="material-symbols-outlined text-lg">download</span>
                     </a>
                  </div>
@@ -591,21 +582,20 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
         ))}
       </div>
       
+      {/* 底部输入框容器 */}
       <div className="absolute bottom-0 inset-x-0 p-4 lg:p-6 bg-gradient-to-t from-black via-black/95 to-transparent backdrop-blur-sm border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
-        <form onSubmit={handleSubmit} className="flex gap-3 max-w-4xl mx-auto">
+        <form onSubmit={handleSubmit} className="flex gap-3 max-w-4xl mx-auto items-center">
           <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 active:scale-95 transition-all">
               <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
               <span className="material-symbols-outlined text-2xl">link</span>
           </label>
-          <div className="flex-1 relative">
-            <input 
-              ref={inputRef}
-              className="w-full h-12 bg-white/5 border border-white/10 rounded-xl px-5 text-[13px] text-white placeholder:text-gray-600 focus:outline-none focus:border-primary/50 focus:bg-white/[0.08] transition-all shadow-inner" 
-              placeholder="加密消息流..." 
-              value={text} 
-              onChange={(e) => setText(e.target.value)} 
-            />
-          </div>
+          <input 
+            ref={inputRef}
+            className="flex-1 h-12 bg-white/5 border border-white/10 rounded-xl px-5 text-[13px] text-white focus:outline-none focus:border-primary/50 transition-all" 
+            placeholder="加密消息..." 
+            value={text} 
+            onChange={(e) => setText(e.target.value)} 
+          />
           <button type="submit" disabled={!text.trim()} className="shrink-0 size-12 bg-primary text-white rounded-xl flex items-center justify-center disabled:opacity-20 active:scale-95 shadow-xl shadow-primary/30 transition-all">
             <span className="material-symbols-outlined text-2xl">arrow_upward</span>
           </button>
