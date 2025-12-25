@@ -11,13 +11,12 @@ const App: React.FC = () => {
   const [roomConfig, setRoomConfig] = useState<RoomConfig | null>(null);
   const [isTabFocused, setIsTabFocused] = useState(true);
 
-  useEffect(() => {
-    // 自动检测魔术链接
+  const checkMagicLink = useCallback(() => {
     const hash = window.location.hash;
     if (hash.includes('offer=')) {
       const params = new URLSearchParams(hash.substring(1));
-      const roomId = params.get('room') || 'AUTO_ROOM';
-      const passphrase = params.get('pass') || 'AUTO_PASS';
+      const roomId = params.get('room') || 'SECURE_P2P';
+      const passphrase = params.get('pass') || 'SECURE_KEY';
       
       const config: RoomConfig = {
         roomId,
@@ -32,6 +31,12 @@ const App: React.FC = () => {
       setView(ViewMode.ROOM);
     }
   }, []);
+
+  useEffect(() => {
+    checkMagicLink();
+    window.addEventListener('hashchange', checkMagicLink);
+    return () => window.removeEventListener('hashchange', checkMagicLink);
+  }, [checkMagicLink]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -77,7 +82,7 @@ const App: React.FC = () => {
       )}
 
       {view === ViewMode.DESIGN && (
-          <SystemDesign onBack={() => (roomConfig ? setView(ViewMode.SETUP) : setView(ViewMode.LANDING))} />
+          <SystemDesign onBack={() => (roomConfig ? setView(ViewMode.ROOM) : setView(ViewMode.LANDING))} />
       )}
 
       {!isTabFocused && view === ViewMode.ROOM && (
@@ -87,7 +92,7 @@ const App: React.FC = () => {
                 <span className="material-symbols-outlined text-primary text-5xl animate-pulse">shield_lock</span>
             </div>
             <h2 className="text-3xl font-black mb-2 tracking-tight text-white">隐私屏蔽已激活</h2>
-            <p className="text-gray-400 font-medium">检测到窗口失焦，实时画面已自动切断。</p>
+            <p className="text-gray-400 font-medium text-sm">检测到窗口失焦，实时画面已自动切断。</p>
             <div className="mt-8 px-6 py-2 bg-primary/10 border border-primary/20 rounded-full inline-flex items-center gap-2">
                 <span className="size-2 rounded-full bg-primary animate-ping"></span>
                 <span className="text-xs font-bold text-primary uppercase tracking-widest">Secure Protocol Running</span>

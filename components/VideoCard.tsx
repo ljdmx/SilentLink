@@ -44,7 +44,7 @@ const VideoCard: React.FC<VideoCardProps> = ({ participant, filter, isLarge }) =
   }, [filter]);
 
   return (
-    <div className={`relative w-full h-full overflow-hidden transition-all duration-700 bg-background ${isLarge ? '' : 'rounded-[2rem] border border-white/10 shadow-3xl'}`}>
+    <div className={`relative w-full h-full overflow-hidden transition-all duration-700 bg-[#06080a] ${isLarge ? '' : 'rounded-[2rem] border border-white/10 shadow-3xl'}`}>
       <video 
         ref={videoRef}
         autoPlay 
@@ -62,28 +62,30 @@ const VideoCard: React.FC<VideoCardProps> = ({ participant, filter, isLarge }) =
           <div className="size-16 rounded-full bg-primary/10 flex items-center justify-center mb-4 text-primary border border-primary/20">
             <span className="material-symbols-outlined text-3xl">visibility_off</span>
           </div>
-          <h3 className="text-[10px] font-black tracking-widest uppercase">Privacy Mode Active</h3>
+          <h3 className="text-[10px] font-black tracking-widest uppercase text-gray-400">Privacy Mode Active</h3>
         </div>
       )}
 
-      {/* Overlays */}
-      <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-black/60 to-transparent pointer-events-none"></div>
+      {/* 渐变遮罩 */}
+      <div className="absolute inset-x-0 bottom-0 h-1/3 bg-gradient-to-t from-black/80 to-transparent pointer-events-none"></div>
       
-      <div className="absolute top-4 left-4 flex flex-wrap gap-2 max-w-[80%]">
+      {/* 名字标签 */}
+      <div className="absolute top-4 left-4 flex flex-wrap gap-2 max-w-[80%] z-10">
         <div className="px-3 py-1.5 bg-black/60 backdrop-blur-xl rounded-xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 border border-white/5 shadow-xl">
-          <span className={`size-2 rounded-full ${participant.audioEnabled ? 'bg-accent' : 'bg-red-500 animate-pulse'}`}></span>
-          <span className="truncate max-w-[120px] text-white">{participant.name} {participant.isLocal ? '(You)' : ''}</span>
+          <span className={`size-1.5 rounded-full ${participant.audioEnabled ? 'bg-accent shadow-[0_0_6px_rgba(34,197,94,0.6)]' : 'bg-red-500 animate-pulse'}`}></span>
+          <span className="truncate max-w-[150px] text-white/90">{participant.name} {participant.isLocal ? '(自己)' : ''}</span>
         </div>
       </div>
 
-      <div className="absolute bottom-4 right-4 flex gap-2">
+      {/* 状态指示器 */}
+      <div className="absolute bottom-4 right-4 flex gap-2 z-10">
          {filter !== PrivacyFilter.NONE && (
-            <div className="size-9 rounded-xl bg-primary/80 backdrop-blur-xl flex items-center justify-center text-white shadow-lg">
-                <span className="material-symbols-outlined text-sm">privacy_tip</span>
+            <div className="size-9 rounded-xl bg-primary/20 backdrop-blur-xl flex items-center justify-center text-primary shadow-lg border border-primary/20">
+                <span className="material-symbols-outlined text-[18px]">privacy_tip</span>
             </div>
          )}
-         <div className={`size-9 rounded-xl backdrop-blur-xl flex items-center justify-center shadow-lg ${participant.audioEnabled ? 'bg-white/10 text-white' : 'bg-red-500/80 text-white'}`}>
-            <span className="material-symbols-outlined text-sm">{participant.audioEnabled ? 'mic' : 'mic_off'}</span>
+         <div className={`size-9 rounded-xl backdrop-blur-xl flex items-center justify-center shadow-lg border ${participant.audioEnabled ? 'bg-white/5 border-white/10 text-white' : 'bg-red-500/20 border-red-500/20 text-red-500'}`}>
+            <span className="material-symbols-outlined text-[18px]">{participant.audioEnabled ? 'mic' : 'mic_off'}</span>
          </div>
       </div>
     </div>
