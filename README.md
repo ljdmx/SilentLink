@@ -1,20 +1,70 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# SecureComm | 零存储端到端加密通信系统
 
-# Run and deploy your AI Studio app
+SecureComm 是一款专为极致隐私设计的点对点（P2P）通信工具。基于 WebRTC 技术栈，通过浏览器原生硬件加固加密，确保您的音视频通话和文件传输仅存在于参与者的内存中，真正实现“阅后即焚，无痕交流”。
 
-This contains everything you need to run your app locally.
+## 核心特性
 
-View your app in AI Studio: https://ai.studio/apps/drive/1-WlmXO0sYAUhlncuonfJTTsCjsUy3rLZ
+- **🔒 绝对隐私 (E2EE)**：采用 AES-256-GCM 算法对所有流量进行端到端加密，密钥由参与者协商产生，不经过任何中转服务器。
+- **🚀 零存储架构**：全应用运行于浏览器内存，关闭网页即物理销毁所有密钥与聊天记录。
+- **🛡️ 隐私防护滤镜**：内置 WebGL 实时滤镜（模糊、马赛克、纯黑），在音视频发出前即完成本地脱敏。
+- **📂 安全文件传输**：支持大文件分片加密传输，同样遵循点对点协议，绕过任何中心化存储。
+- **📱 响应式设计**：完美适配手机与 PC 屏幕，移动端优化聊天与控制栏交互体验。
+- **👻 自动保护**：检测到浏览器标签失焦或最小化时，自动遮盖视频画面。
 
-## Run Locally
+## 技术栈
 
-**Prerequisites:**  Node.js
+- **Frontend**: React 19 + Tailwind CSS
+- **Communication**: WebRTC (RTCPeerConnection, RTCDataChannel)
+- **Security**: Web Crypto API (SubtleCrypto)
+- **Build/Import**: ESM Modules / esm.sh
 
+---
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## 快速上手
+
+### 1. 部署教程
+
+本项目为纯前端应用，无需复杂的后端配置。
+
+#### 静态托管（推荐）
+1. 将本项目的所有文件（`index.html`, `index.tsx`, `App.tsx`, `components/` 等）上传至任何静态文件服务器（如 Nginx, GitHub Pages, Vercel 或 Netlify）。
+2. 确保您的托管环境支持 HTTPS（WebRTC 必须在安全上下文运行才能调用摄像头）。
+
+### 2. 使用指南
+
+#### 步骤一：创建/加入房间
+- 在首页点击“初始化安全频道”。
+- 设置您的显示名称、房间 ID（选填）和**会话口令**（双方必须一致才能解密）。
+- 选择默认的隐私滤镜。
+
+#### 步骤二：建立隧道（手动握手逻辑）
+由于本系统采用零服务器策略，握手需要手动交换信令：
+1. **发起方 (Initiator)**：点击“作为发起方”，系统将生成一个加密链接。将其发送给您的好友。
+2. **接收方 (Receiver)**：点击好友发送的链接，或手动点击“作为接收方”并注入请求代码，生成“响应代码”并回传给发起方。
+3. **完成连接**：发起方填入响应代码，点击“开启隧道”。
+
+#### 步骤三：开始交流
+- 连接成功后，左上角状态将变为 **CONNECTED**。
+- 您可以使用底部工具栏切换隐私滤镜、静音或开启聊天窗口。
+- 聊天窗口支持发送文本和点击链接图标上传文件。
+
+### 3. 物理退出
+点击右上角的“物理退出”按钮。这将：
+1. 发送终止信号给对方，使其同步关闭。
+2. 销毁本地所有媒体轨道（摄像头/麦克风）。
+3. 清空内存中存储的所有加密密钥和历史消息。
+4. 重定向回首页。
+
+---
+
+## 安全注意事项
+
+1. **口令安全**：会话口令是派生加密密钥的基础，请通过其他安全渠道告知对方。
+2. **HTTPS 强制**：在非 HTTPS 环境下，浏览器将禁止调用摄像头和麦克风。
+3. **STUN 服务**：默认使用 Google 的公开 STUN 服务进行 NAT 穿透。如果您处于特殊的内网环境，可能需要配置自定义的 TURN 服务。
+
+---
+
+## 开源协议
+
+本项目采用 MIT 协议开源。
