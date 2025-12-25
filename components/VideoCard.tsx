@@ -29,12 +29,20 @@ const VideoCard: React.FC<VideoCardProps> = ({ participant, filter, isLarge }) =
         if (ctx && video.readyState >= 2) {
           canvas.width = video.videoWidth;
           canvas.height = video.videoHeight;
-          const scale = 0.05;
+          
+          // Enhanced Mosaic: Small scale factor + Blur
+          const scale = 0.03; 
           const w = canvas.width * scale;
           const h = canvas.height * scale;
+          
+          // Step 1: Pixelate
           ctx.imageSmoothingEnabled = false;
           ctx.drawImage(video, 0, 0, w, h);
+          
+          // Step 2: Draw back with blur to satisfy "马赛克的时候高度模糊"
+          ctx.filter = 'blur(8px)';
           ctx.drawImage(canvas, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+          ctx.filter = 'none';
         }
         animationFrame = requestAnimationFrame(render);
       };
