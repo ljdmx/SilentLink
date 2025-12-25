@@ -21,9 +21,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [isRemoteMuted, setIsRemoteMuted] = useState(false);
   const [isRemoteHidden, setIsRemoteHidden] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
-  const [showLocalPreview, setShowLocalPreview] = useState(true); // 控制本地预览显隐
+  const [showLocalPreview, setShowLocalPreview] = useState(true);
   
-  // 核心状态衍生
   const localParticipant = participants.find(p => p.isLocal);
   const remoteParticipant = participants.find(p => !p.isLocal);
 
@@ -47,7 +46,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     filterRef.current = currentFilter;
   }, [currentFilter]);
 
-  // 握手计时器
   useEffect(() => {
     let timer: number;
     if (role !== 'none' && connectionStatus !== 'connected' && handshakeTimer > 0) {
@@ -73,7 +71,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
-  // 隐私滤镜引擎
+  // 高级隐私滤镜引擎：直接修改发送出去的流
   useEffect(() => {
     let animationFrame: number;
     const canvas = filterCanvasRef.current;
@@ -126,7 +124,43 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
   }, []);
 
-  // 接收方自动检测并回复逻辑
+  const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
+    const pc = new RTCPeerConnection({ 
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+      ],
+      iceCandidatePoolSize: 10
+    });
+
+    peersRef.current.set(remoteId, pc);
+
+    processedStreamRef.current?.getTracks().forEach(track => { 
+      if (processedStreamRef.current) pc.addTrack(track, processedStreamRef.current); 
+    });
+
+    pc.ontrack = (e) => { 
+      addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log("Connection state:", pc.connectionState);
+      if (pc.connectionState === 'connected') setConnectionStatus('connected');
+      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
+    };
+
+    if (isOffer) {
+      const dc = pc.createDataChannel('secure-chat-tunnel', { ordered: true });
+      setupDataChannel(remoteId, dc);
+    } else { 
+      pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); 
+    }
+    return pc;
+  };
+
   const handleOfferAndReply = useCallback(async (forcedOffer?: string) => {
     const offerToProcess = forcedOffer || remoteSDPInput;
     if (!offerToProcess) return;
@@ -138,7 +172,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const answer = await pc.createAnswer(); 
       await pc.setLocalDescription(answer);
       
-      // 监测 ICE 收集
       pc.onicegatheringstatechange = () => {
         if (pc.iceGatheringState === 'complete') {
           setLocalSDP(btoa(JSON.stringify(pc.localDescription))); 
@@ -180,34 +213,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       rawStreamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, [config.roomId, config.userName, config.passphrase, addParticipant]);
-
-  const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
-    const pc = new RTCPeerConnection({ 
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' }
-      ]
-    });
-    peersRef.current.set(remoteId, pc);
-    processedStreamRef.current?.getTracks().forEach(track => { 
-      if (processedStreamRef.current) pc.addTrack(track, processedStreamRef.current); 
-    });
-    pc.ontrack = (e) => { 
-      addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
-    };
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') setConnectionStatus('connected');
-      if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) removeParticipant(remoteId);
-    };
-    if (isOffer) {
-      const dc = pc.createDataChannel('secure-chat-tunnel', { ordered: true });
-      setupDataChannel(remoteId, dc);
-    } else { pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); }
-    return pc;
-  };
 
   const setupDataChannel = (remoteId: string, dc: RTCDataChannel) => {
     dataChannelsRef.current.set(remoteId, dc);
@@ -266,29 +271,39 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const handleFileUpload = async (file: File) => {
     if (!encryptionKeyRef.current) return;
     const fileId = Math.random().toString(36).substring(7);
+    const metaPayload = { type: 'file-meta', id: fileId, name: file.name, size: file.size, mimeType: file.type };
+    
     setFiles(prev => [{ id: fileId, name: file.name, size: file.size, progress: 0, status: 'transferring', mimeType: file.type }, ...prev]);
-    const meta = JSON.stringify({ type: 'file-meta', id: fileId, name: file.name, size: file.size, mimeType: file.type });
-    dataChannelsRef.current.forEach(dc => { if (dc.readyState === 'open') dc.send(meta); });
+    
+    dataChannelsRef.current.forEach(dc => { 
+      if (dc.readyState === 'open') dc.send(JSON.stringify(metaPayload)); 
+    });
+
     const reader = file.stream().getReader();
     let offset = 0;
     const chunks: ArrayBuffer[] = [];
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       chunks.push(value.buffer);
       const { data, iv } = await encryptBuffer(encryptionKeyRef.current, value.buffer);
       const packet = new Uint8Array(iv.length + data.byteLength);
-      packet.set(iv, 0); packet.set(new Uint8Array(data), iv.length);
+      packet.set(iv, 0); 
+      packet.set(new Uint8Array(data), iv.length);
+      
       dataChannelsRef.current.forEach(dc => { if (dc.readyState === 'open') dc.send(packet); });
       offset += value.byteLength;
       setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.round((offset / file.size) * 100) } : f));
     }
+
     const blobUrl = URL.createObjectURL(new Blob(chunks, { type: file.type }));
     setMessages(prev => [...prev, { id: fileId, senderId: 'local', senderName: config.userName, blobUrl, type: file.type.startsWith('image/') ? 'image' : 'file', fileName: file.name, timestamp: Date.now() }]);
     setFiles(prev => prev.map(f => f.id === fileId ? { ...f, status: 'completed' } : f));
   };
 
   const receivingFileRef = useRef<{ id: string; name: string; size: number; received: number; chunks: ArrayBuffer[]; mimeType?: string } | null>(null);
+  
   const handleFileMetaReceive = (meta: any) => {
     receivingFileRef.current = { ...meta, received: 0, chunks: [] };
     setFiles(prev => [{ id: meta.id, name: meta.name, size: meta.size, progress: 0, status: 'transferring', mimeType: meta.mimeType }, ...prev]);
@@ -300,15 +315,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     try {
       const iv = new Uint8Array(data.slice(0, 12));
       const decryptedChunk = await decryptBuffer(encryptionKeyRef.current, data.slice(12), iv);
-      state.chunks.push(decryptedChunk); state.received += decryptedChunk.byteLength;
+      state.chunks.push(decryptedChunk); 
+      state.received += decryptedChunk.byteLength;
+      
       setFiles(prev => prev.map(f => f.id === state.id ? { ...f, progress: Math.round((state.received / state.size) * 100) } : f));
+      
       if (state.received >= state.size) {
         const blobUrl = URL.createObjectURL(new Blob(state.chunks, { type: state.mimeType }));
         setMessages(prev => [...prev, { id: state.id, senderId: 'peer', senderName: '对方', blobUrl, type: state.mimeType?.startsWith('image/') ? 'image' : 'file', fileName: state.name, timestamp: Date.now() }]);
         setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
         receivingFileRef.current = null;
       }
-    } catch (e) { console.error("File decrypt failed", e); }
+    } catch (e) { console.error("File chunk decrypt failed", e); }
   };
 
   const toggleMyMic = () => {
@@ -418,8 +436,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
                             {handshakeTimer === 0 && (
                                 <div className="mt-8 pt-8 border-t border-white/5 text-center space-y-4 animate-in fade-in slide-in-from-bottom-2">
-                                    <p className="text-[10px] text-red-400 font-bold uppercase tracking-widest">握手时间已耗尽</p>
-                                    <button onClick={() => window.location.reload()} className="px-6 py-2 bg-white/5 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-gray-400 hover:text-white transition-colors">重置节点</button>
+                                    <p className="text-[10px] text-red-400 font-bold uppercase tracking-widest">握手窗口已关闭</p>
+                                    <button onClick={() => window.location.reload()} className="px-6 py-2 bg-white/5 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-gray-400 hover:text-white transition-colors">重新同步节点</button>
                                 </div>
                             )}
                         </div>
@@ -439,7 +457,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 )}
               </div>
               
-              {/* 本地视频预览：左下角悬浮，避开底栏 */}
+              {/* 本地视频预览：左下角，避让底部栏 */}
               {showLocalPreview && localParticipant && (
                 <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-10 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-95 duration-300">
                   <VideoCard participant={localParticipant} filter={currentFilter} />
@@ -472,8 +490,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           <div className="flex items-center gap-1 lg:gap-3 px-1.5">
             <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={toggleMyMic} danger={isMuted} label="静音" />
             <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={toggleMyPrivacy} label="马赛克" />
-            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏蔽画面" />
-            {/* 本地预览开关按钮 */}
+            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏闭画面" />
             <ControlBtn icon={showLocalPreview ? 'picture_in_picture' : 'picture_in_picture_alt'} active={showLocalPreview} onClick={() => setShowLocalPreview(!showLocalPreview)} label="预览开关" />
           </div>
           <div className="w-px h-8 bg-white/10 mx-1"></div>
@@ -537,7 +554,7 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
                 </div>
                 <div className="space-y-1 px-10">
                     <p className="text-[11px] font-black uppercase tracking-[0.4em]">端对端加密通道</p>
-                    <p className="text-[9px] font-medium leading-relaxed">消息仅通过 P2P 隧道传输</p>
+                    <p className="text-[9px] font-medium leading-relaxed">消息仅通过 P2P 隧道传输，关闭即物理抹除</p>
                 </div>
             </div>
         )}
@@ -556,12 +573,11 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
                     ) : (
                         <div className="p-4 lg:p-5 flex items-center gap-4 bg-black/20">
                             <div className="size-11 rounded-xl bg-white/5 flex items-center justify-center border border-white/10 text-primary">
-                                {/* 文件图标换成 link 图标 */}
                                 <span className="material-symbols-outlined text-xl">link</span>
                             </div>
                             <div className="flex flex-col min-w-0">
                                 <span className="text-[11px] font-bold truncate pr-6 text-white">{m.fileName}</span>
-                                <span className="text-[8px] opacity-40 uppercase tracking-widest mt-0.5 font-mono">P2P Encrypted Data</span>
+                                <span className="text-[8px] opacity-40 uppercase tracking-widest mt-0.5">Verified E2EE Data</span>
                             </div>
                         </div>
                     )}
@@ -579,7 +595,7 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
         <form onSubmit={handleSubmit} className="flex gap-3 max-w-4xl mx-auto">
           <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 active:scale-95 transition-all">
               <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
-              <span className="material-symbols-outlined text-2xl">add_photo_alternate</span>
+              <span className="material-symbols-outlined text-2xl">link</span>
           </label>
           <div className="flex-1 relative">
             <input 
