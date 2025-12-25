@@ -26,6 +26,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [remoteSDPInput, setRemoteSDPInput] = useState('');
   const [connectionStatus, setConnectionStatus] = useState<'idle' | 'preparing' | 'ready' | 'connected'>('idle');
   const [handshakeStep, setHandshakeStep] = useState(1);
+  const [countdown, setCountdown] = useState(180); // 3分钟握手倒计时
 
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
@@ -47,6 +48,15 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
+  // 倒计时逻辑
+  useEffect(() => {
+    let timer: number;
+    if ((role !== 'none') && connectionStatus !== 'connected' && countdown > 0) {
+      timer = window.setInterval(() => setCountdown(prev => prev - 1), 1000);
+    }
+    return () => clearInterval(timer);
+  }, [role, connectionStatus, countdown]);
+
   useEffect(() => {
     const init = async () => {
       encryptionKeyRef.current = await deriveKey(config.passphrase, config.roomId);
@@ -57,9 +67,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         });
         localStreamRef.current = stream;
         addParticipant({ id: 'local', name: config.userName, isLocal: true, isHost: true, audioEnabled: true, videoEnabled: true, stream });
-      } catch (err) { console.error("Media access error:", err); }
+      } catch (err) { 
+        console.error("Media access error:", err); 
+      }
 
-      // 自动响应魔术链接中的 Offer
+      // 自动识别魔术链接逻辑
       const hash = window.location.hash;
       if (hash.includes('offer=')) {
         const params = new URLSearchParams(hash.substring(1));
@@ -67,11 +79,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         if (offerData) {
           setRemoteSDPInput(offerData);
           setRole('receiver');
-          // 延迟一点点等待本地流和密钥就绪后自动解析
+          // 接收方全自动执行解析
           setTimeout(() => {
-            const btn = document.getElementById('auto-parse-btn');
-            if (btn) btn.click();
-          }, 1000);
+            const parseBtn = document.getElementById('auto-action-trigger');
+            if (parseBtn) parseBtn.click();
+          }, 800);
         }
       }
     };
@@ -87,21 +99,27 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     peersRef.current.set(remoteId, pc);
-    localStreamRef.current?.getTracks().forEach(track => { if (localStreamRef.current) pc.addTrack(track, localStreamRef.current); });
-    pc.ontrack = (e) => { addParticipant({ id: remoteId, name: "远端成员", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); };
+    localStreamRef.current?.getTracks().forEach(track => { 
+      if (localStreamRef.current) pc.addTrack(track, localStreamRef.current); 
+    });
+    pc.ontrack = (e) => { 
+      addParticipant({ id: remoteId, name: "远端成员", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
+    };
     pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'connected') setConnectionStatus('connected');
-        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-            removeParticipant(remoteId);
-            if (peersRef.current.size === 0) {
-                setConnectionStatus('idle'); setRole('none'); setLocalSDP(''); setRemoteSDPInput(''); setHandshakeStep(1); window.location.hash = '';
-            }
+      if (pc.connectionState === 'connected') setConnectionStatus('connected');
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        removeParticipant(remoteId);
+        if (peersRef.current.size === 0) {
+          setConnectionStatus('idle'); setRole('none'); setLocalSDP(''); setRemoteSDPInput(''); setHandshakeStep(1); window.location.hash = ''; setCountdown(180);
         }
+      }
     };
     if (isOffer) {
       const dc = pc.createDataChannel('secure-tunnel', { ordered: true });
       setupDataChannel(remoteId, dc);
-    } else { pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); }
+    } else { 
+      pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); 
+    }
     return pc;
   };
 
@@ -114,20 +132,30 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
           if (payload.type === 'chat' && encryptionKeyRef.current) {
             const text = await decryptMessage(encryptionKeyRef.current, payload.data, payload.iv);
             setMessages(prev => [...prev, { id: Date.now().toString(), senderId: remoteId, senderName: '对方', text, type: 'text', timestamp: Date.now() }]);
-          } else if (payload.type === 'file-meta') handleFileMetaReceive(payload);
-        } catch (err) { console.error("Data processing error:", err); }
-      } else handleFileChunkReceive(e.data);
+          } else if (payload.type === 'file-meta') {
+            handleFileMetaReceive(payload);
+          }
+        } catch (err) { 
+          console.error("Data error:", err); 
+        }
+      } else {
+        handleFileChunkReceive(e.data);
+      }
     };
   };
 
   const startAsInitiator = async () => {
-    setRole('initiator'); setConnectionStatus('preparing');
+    setRole('initiator'); 
+    setConnectionStatus('preparing');
     const pc = await setupPeerConnection('peer', true);
-    const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+    const offer = await pc.createOffer(); 
+    await pc.setLocalDescription(offer);
     const onIceComplete = () => {
       if (pc.iceGatheringState === 'complete') {
         const sdp = btoa(JSON.stringify(pc.localDescription));
-        setLocalSDP(sdp); setConnectionStatus('ready'); setHandshakeStep(2);
+        setLocalSDP(sdp); 
+        setConnectionStatus('ready'); 
+        setHandshakeStep(2);
       }
     };
     pc.onicegatheringstatechange = onIceComplete;
@@ -140,7 +168,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const decoded = JSON.parse(atob(remoteSDPInput));
       const pc = peersRef.current.get('peer');
       if (pc && decoded.type === 'answer') await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-    } catch (e) { alert("代码解析失败"); }
+    } catch (e) { 
+      alert("代码解析失败"); 
+    }
   };
 
   const handleOfferAndReply = async () => {
@@ -151,19 +181,24 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       setConnectionStatus('preparing');
       const pc = await setupPeerConnection('peer', false);
       await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-      const answer = await pc.createAnswer(); await pc.setLocalDescription(answer);
+      const answer = await pc.createAnswer(); 
+      await pc.setLocalDescription(answer);
       const onIceComplete = () => {
         if (pc.iceGatheringState === 'complete') {
-          setLocalSDP(btoa(JSON.stringify(pc.localDescription))); setConnectionStatus('ready'); setHandshakeStep(2);
+          setLocalSDP(btoa(JSON.stringify(pc.localDescription))); 
+          setConnectionStatus('ready'); 
+          setHandshakeStep(2);
         }
       };
       pc.onicegatheringstatechange = onIceComplete;
       if (pc.iceGatheringState === 'complete') onIceComplete();
-    } catch (e) { alert("解析失败"); }
+    } catch (e) { 
+      alert("解析失败"); 
+    }
   };
 
   const getInviteLink = () => {
-    const url = new URL(window.location.href);
+    const url = new URL(window.location.href.split('#')[0]);
     url.hash = `room=${config.roomId}&pass=${config.passphrase}&offer=${localSDP}`;
     return url.toString();
   };
@@ -192,7 +227,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       chunks.push(value.buffer);
       const { data, iv } = await encryptBuffer(encryptionKeyRef.current, value.buffer);
       const packet = new Uint8Array(iv.length + data.byteLength);
-      packet.set(iv, 0); packet.set(new Uint8Array(data), iv.length);
+      packet.set(iv, 0); 
+      packet.set(new Uint8Array(data), iv.length);
       dataChannelsRef.current.forEach(dc => { if (dc?.readyState === 'open') dc.send(packet); });
       offset += value.byteLength;
       setFiles(prev => prev.map(f => f.id === fileId ? { ...f, progress: Math.round((offset / file.size) * 100) } : f));
@@ -210,12 +246,14 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   };
 
   const handleFileChunkReceive = async (data: ArrayBuffer) => {
-    const state = receivingFileRef.current; if (!state || !encryptionKeyRef.current) return;
+    const state = receivingFileRef.current; 
+    if (!state || !encryptionKeyRef.current) return;
     try {
       const iv = new Uint8Array(data.slice(0, 12));
       const encryptedData = data.slice(12);
       const decryptedChunk = await decryptBuffer(encryptionKeyRef.current, encryptedData, iv);
-      state.chunks.push(decryptedChunk); state.received += decryptedChunk.byteLength;
+      state.chunks.push(decryptedChunk); 
+      state.received += decryptedChunk.byteLength;
       const progress = Math.round((state.received / state.size) * 100);
       setFiles(prev => prev.map(f => f.id === state.id ? { ...f, progress } : f));
       if (state.received >= state.size) {
@@ -226,7 +264,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
         receivingFileRef.current = null;
       }
-    } catch (e) { console.error("File decryption error:", e); }
+    } catch (e) { 
+      console.error("Decryption error:", e); 
+    }
   };
 
   const remoteParticipant = participants.find(p => !p.isLocal);
@@ -247,7 +287,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             </div>
           </div>
         </div>
-        <button onClick={onExit} className="h-8 px-4 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 text-[10px] font-black uppercase tracking-widest transition-all">断开节点</button>
+        <button onClick={onExit} className="h-8 px-4 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 text-[10px] font-black uppercase tracking-widest transition-all">物理断开</button>
       </header>
 
       <main className="flex-1 flex overflow-hidden relative p-2 pt-0">
@@ -257,41 +297,48 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 {role === 'none' ? (
                     <div className="text-center space-y-12 max-w-2xl animate-in zoom-in-95">
                         <div className="space-y-4">
-                            <h3 className="text-3xl lg:text-5xl font-black text-white tracking-tighter uppercase italic italic leading-none">安全握手协议</h3>
-                            <p className="text-gray-500 text-sm font-medium leading-relaxed max-w-lg mx-auto uppercase tracking-widest">正在建立 P2P 加密隧道。请选择您的节点角色。</p>
+                            <h3 className="text-4xl lg:text-6xl font-black text-white tracking-tighter uppercase italic leading-none">握手建立中</h3>
+                            <p className="text-gray-500 text-xs font-black uppercase tracking-[0.4em]">请选择您的节点身份以同步 E2EE 载荷</p>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-3xl">
                             <button onClick={startAsInitiator} className="group flex flex-col items-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-primary/10 hover:border-primary/40 transition-all active:scale-95 shadow-xl">
                                 <span className="material-symbols-outlined text-5xl text-primary animate-pulse">rocket_launch</span>
-                                <h4 className="text-xl font-black text-white uppercase tracking-widest">我是发起方</h4>
+                                <h4 className="text-xl font-black text-white uppercase tracking-widest">作为发起方</h4>
                             </button>
                             <button onClick={() => setRole('receiver')} className="group flex flex-col items-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-accent/10 hover:border-accent/40 transition-all active:scale-95 shadow-xl">
                                 <span className="material-symbols-outlined text-5xl text-accent">join_inner</span>
-                                <h4 className="text-xl font-black text-white uppercase tracking-widest">我是接收方</h4>
+                                <h4 className="text-xl font-black text-white uppercase tracking-widest">作为接收方</h4>
                             </button>
                         </div>
                     </div>
                 ) : (
-                    <div className="w-full max-w-3xl animate-in slide-in-from-bottom-10">
+                    <div className="w-full max-w-3xl animate-in slide-in-from-bottom-10 relative">
+                        {/* 倒计时显示 */}
+                        <div className="absolute -top-16 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-white/5 px-6 py-2 rounded-full border border-white/5">
+                            <span className="material-symbols-outlined text-sm text-gray-500">timer</span>
+                            <span className="text-xs font-mono font-black text-white">
+                                {Math.floor(countdown / 60)}:{(countdown % 60).toString().padStart(2, '0')}
+                            </span>
+                            <span className="text-[8px] text-gray-500 uppercase tracking-widest">握手有效期限</span>
+                        </div>
+
                         <div className={`glass rounded-[3.5rem] p-10 lg:p-16 bg-black/40 border-t-8 transition-all ${role === 'initiator' ? 'border-t-primary' : 'border-t-accent'}`}>
                             {role === 'initiator' ? (
                                 <div className="space-y-10">
                                     {handshakeStep === 2 && (
-                                        <div className="space-y-10 animate-in zoom-in-95 text-center">
+                                        <div className="space-y-10 animate-in zoom-in-95">
                                             <div className="space-y-4">
-                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 1 步：分享邀请链接</h4>
+                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 1 步：分发安全气闸</h4>
                                                 <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-20 bg-primary/10 border-2 border-primary/30 hover:border-primary text-primary rounded-[2rem] font-black uppercase tracking-widest flex items-center justify-center gap-4 transition-all shadow-xl active:scale-95">
                                                     <span className="material-symbols-outlined text-2xl">{isCopied ? 'check_circle' : 'share'}</span>
-                                                    <span className="text-lg">{isCopied ? '魔术链接已复制' : '分享魔术链接'}</span>
+                                                    <span className="text-lg">{isCopied ? '魔术链接已复制' : '分享魔术邀请链接'}</span>
                                                 </button>
-                                                <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">对方打开链接后将自动识别 Offer</p>
                                             </div>
-                                            <div className="h-px bg-white/5 w-1/2 mx-auto"></div>
-                                            <div className="space-y-4 text-left">
-                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 2 步：回填 Answer 代码</h4>
+                                            <div className="space-y-4">
+                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 2 步：验证并激活连接</h4>
                                                 <div className="relative">
-                                                    <textarea placeholder="粘贴对方发回的回执代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none resize-none transition-all focus:border-accent/40" />
-                                                    <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-4 right-4 h-12 px-8 bg-accent text-black rounded-xl font-black uppercase tracking-widest active:scale-95 disabled:opacity-30 shadow-lg">激活连接</button>
+                                                    <textarea placeholder="粘贴对方生成的代码 (Answer)..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none resize-none transition-all focus:border-accent/40" />
+                                                    <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-4 right-4 h-12 px-8 bg-accent text-black rounded-xl font-black uppercase tracking-widest active:scale-95 disabled:opacity-30">物理激活</button>
                                                 </div>
                                             </div>
                                         </div>
@@ -300,17 +347,17 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                             ) : (
                                 <div className="space-y-10">
                                     <div className="space-y-4">
-                                        <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">解析 Offer 握手包</h4>
-                                        <textarea placeholder="在此粘贴发起方的代码 (Offer)..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none focus:border-accent/40 transition-all" />
-                                        <button id="auto-parse-btn" onClick={handleOfferAndReply} className="w-full h-16 bg-white/5 border border-white/10 text-white rounded-[2rem] font-black uppercase tracking-widest hover:bg-white/10 active:scale-95 transition-all">解析 Offer 并生成回应</button>
+                                        <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">解析加密 Offer</h4>
+                                        <textarea placeholder="在此输入发起方的 Offer 代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none focus:border-accent/40 transition-all" />
+                                        <button id="auto-action-trigger" onClick={handleOfferAndReply} className="w-full h-16 bg-white/5 border border-white/10 text-white rounded-[2rem] font-black uppercase tracking-widest hover:bg-white/10 active:scale-95 transition-all">一键解析并生成回应</button>
                                     </div>
                                     {handshakeStep === 2 && (
                                         <div className="space-y-4 animate-in slide-in-from-top-4">
-                                            <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 2 步：将回执发还给发起方</h4>
+                                            <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">将回执发回发起方</h4>
                                             <button onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-16 bg-accent text-black rounded-[2rem] font-black uppercase tracking-widest shadow-xl shadow-accent/20 active:scale-95 transition-all">
-                                                {isCopied ? '已复制 ANSWER' : '复制回执代码 (Answer)'}
+                                                {isCopied ? '已复制 ANSWER' : '复制回执代码'}
                                             </button>
-                                            <p className="text-[9px] text-center text-accent/60 font-black uppercase tracking-widest animate-pulse">等待发起方激活连接...</p>
+                                            <p className="text-[9px] text-center text-accent/60 font-black uppercase tracking-widest animate-pulse">等待对方最终激活节点连接...</p>
                                         </div>
                                     )}
                                 </div>
@@ -321,49 +368,52 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             </div>
           ) : (
             <div className="flex-1 relative overflow-hidden group/room">
-              {/* 主要画面：对方 (远端成员) */}
-              <div className="absolute inset-0 z-0 bg-[#06080a]">
+              {/* 主要画面：对方 (远端) */}
+              <div className="absolute inset-0 z-0 bg-black">
                 {remoteParticipant ? (
                   <VideoCard participant={remoteParticipant} filter={PrivacyFilter.NONE} isLarge />
                 ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center space-y-4 opacity-50">
-                    <div className="size-20 rounded-full border-4 border-primary/20 border-t-primary animate-spin mb-4"></div>
-                    <p className="text-xs font-black uppercase tracking-[0.5em] text-gray-500 italic">加密载荷注入中...</p>
+                  <div className="w-full h-full flex flex-col items-center justify-center space-y-6 opacity-60">
+                    <div className="size-16 rounded-full border-[3px] border-primary/20 border-t-primary animate-spin"></div>
+                    <div className="text-center space-y-2">
+                        <p className="text-xs font-black uppercase tracking-[0.5em] text-white">载荷流同步中</p>
+                        <p className="text-[9px] font-mono text-gray-500">PEER CONNECTION: ESTABLISHING...</p>
+                    </div>
                   </div>
                 )}
               </div>
 
-              {/* 悬浮小窗：自己 (本地画面) */}
-              <div className="absolute bottom-6 left-6 w-48 lg:w-72 aspect-video z-50 transition-all duration-500 hover:scale-[1.03] border-2 border-white/10 rounded-[1.5rem] lg:rounded-[2rem] overflow-hidden shadow-2xl shadow-black/80">
+              {/* 悬浮画面：自己 (本地) */}
+              <div className="absolute bottom-6 left-6 w-48 lg:w-72 aspect-video z-50 transition-all duration-500 hover:scale-[1.03] border-2 border-white/10 rounded-[1.5rem] lg:rounded-[2rem] overflow-hidden shadow-2xl shadow-black/90 group/local">
                 {localParticipant && (
                   <VideoCard participant={localParticipant} filter={currentFilter} />
                 )}
-                <div className="absolute top-3 left-3 px-2 py-0.5 bg-black/60 backdrop-blur-md rounded-md text-[8px] font-black text-white uppercase tracking-widest">
-                  本地预览
+                <div className="absolute top-3 left-3 px-2 py-0.5 bg-black/60 backdrop-blur-md rounded-md text-[8px] font-black text-white uppercase tracking-widest opacity-0 group-hover/local:opacity-100 transition-opacity">
+                  本地画面预览
                 </div>
               </div>
             </div>
           )}
         </div>
 
-        {/* 侧边多媒体聊天面板 */}
-        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-96 glass transform transition-all duration-300 z-[110] flex flex-col lg:m-2 lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100 shadow-3xl' : 'translate-y-full lg:hidden opacity-0 scale-95 pointer-events-none'}`}>
+        {/* E2EE 聊天 & 多媒体面板 */}
+        <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-96 glass transform transition-all duration-300 z-[110] flex flex-col lg:m-2 lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 scale-95 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/40 shrink-0">
                 <div className="flex items-center gap-2">
                     <span className="size-2 rounded-full bg-accent animate-pulse shadow-[0_0_8px_#22c55e]"></span>
-                    <h3 className="text-[10px] font-black uppercase tracking-widest text-gray-400">P2P 加密隧道</h3>
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-gray-400">E2EE 隧道实时监控</h3>
                 </div>
                 <button onClick={() => setIsChatOpen(false)} className="size-8 rounded-full hover:bg-white/10 flex items-center justify-center transition-colors">
                     <span className="material-symbols-outlined text-lg text-gray-500">close</span>
                 </button>
              </div>
-             <div className="flex-1 overflow-hidden bg-[#080a0c] flex flex-col">
+             <div className="flex-1 overflow-hidden bg-[#0a0c0e] flex flex-col">
                 <ChatBox messages={messages} onSend={sendMessage} userName={config.userName} onUpload={handleFileUpload} />
              </div>
         </div>
       </main>
 
-      {/* 底部控制面板 */}
+      {/* 控制栏 */}
       {connectionStatus === 'connected' && (
         <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 p-3 glass rounded-[2rem] z-[100] shadow-2xl shadow-black animate-in slide-in-from-bottom-10">
           <div className="flex items-center gap-1 bg-white/5 p-1 rounded-2xl mr-2">
@@ -404,20 +454,22 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
         {messages.map(m => (
           <div key={m.id} className={`flex flex-col ${m.senderId === 'local' ? 'items-end' : 'items-start'}`}>
              <span className="text-[8px] font-black text-gray-600 mb-1 px-1 uppercase tracking-widest">{m.senderName}</span>
-             <div className={`rounded-2xl max-w-[90%] overflow-hidden shadow-xl ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-white/5 border border-white/10 text-gray-300 rounded-tl-none'}`}>
+             <div className={`rounded-2xl max-w-[92%] overflow-hidden shadow-xl ${m.senderId === 'local' ? 'bg-primary text-white rounded-tr-none' : 'bg-white/5 border border-white/10 text-gray-300 rounded-tl-none'}`}>
                {m.type === 'text' && <p className="px-4 py-3 text-xs leading-relaxed break-words">{m.text}</p>}
                
-               {/* 图片即时预览 */}
+               {/* 增强：图片内嵌预览 */}
                {m.type === 'image' && (
-                 <img src={m.blobUrl} className="w-full h-auto cursor-pointer hover:opacity-90 transition-opacity" onClick={() => window.open(m.blobUrl)} />
+                 <div className="relative group/img">
+                    <img src={m.blobUrl} className="w-full h-auto cursor-zoom-in hover:brightness-110 transition-all" alt="Sent encrypted" onClick={() => window.open(m.blobUrl)} />
+                 </div>
                )}
                
-               {/* 视频即时播放 */}
+               {/* 增强：视频内嵌播放 */}
                {m.type === 'video' && (
-                 <video src={m.blobUrl} controls className="w-full h-auto bg-black aspect-video" />
+                 <video src={m.blobUrl} controls className="w-full h-auto bg-black aspect-video outline-none" />
                )}
                
-               {/* 多媒体底部信息栏 & 下载按钮 */}
+               {/* 附件/多媒体信息栏 */}
                {(m.type === 'image' || m.type === 'video' || m.type === 'file') && (
                  <div className="px-4 py-2 bg-black/40 flex items-center justify-between gap-4 border-t border-white/5">
                    <div className="flex items-center gap-2 overflow-hidden">
@@ -439,15 +491,15 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
           </div>
         ))}
       </div>
-      <div className="p-4 bg-black/60 border-t border-white/5 shrink-0 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+      <div className="p-4 bg-black/60 border-t border-white/5 shrink-0 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
         <form onSubmit={(e) => { e.preventDefault(); if (text.trim()) { onSend(text); setText(''); } }} className="relative flex gap-2">
-          <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 transition-colors active:scale-90">
+          <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 transition-colors active:scale-90 shadow-inner">
               <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
               <span className="material-symbols-outlined">add_circle</span>
           </label>
           <input 
             className="flex-1 h-12 bg-white/5 border border-white/10 rounded-xl px-4 text-xs text-white focus:outline-none focus:border-primary/50 transition-all placeholder:text-gray-700" 
-            placeholder="加密消息..." 
+            placeholder="输入受保护消息..." 
             value={text} 
             onChange={(e) => setText(e.target.value)} 
           />
