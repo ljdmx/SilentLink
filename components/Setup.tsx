@@ -47,7 +47,7 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
             <div className="space-y-3">
               <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1 flex items-center gap-2">
                 <span className="size-1.5 rounded-full bg-primary"></span>
-                房间 ID (Room ID)
+                房间 ID
               </label>
               <input 
                 autoComplete="off"
@@ -110,10 +110,10 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
                   value={defaultFilter}
                   onChange={(e) => setDefaultFilter(e.target.value as PrivacyFilter)}
                 >
-                  <option value={PrivacyFilter.NONE}>公开 (None)</option>
-                  <option value={PrivacyFilter.BLUR}>模糊 (Blur)</option>
-                  <option value={PrivacyFilter.MOSAIC}>马赛克 (Mosaic)</option>
-                  <option value={PrivacyFilter.BLACK}>隐藏 (Hidden)</option>
+                  <option value={PrivacyFilter.NONE}>公开 </option>
+                  <option value={PrivacyFilter.BLUR}>模糊</option>
+                  <option value={PrivacyFilter.MOSAIC}>马赛克 </option>
+                  <option value={PrivacyFilter.BLACK}>隐藏</option>
                 </select>
               </div>
               <div className="bg-black/20 rounded-2xl p-4 border border-white/5 flex gap-4 items-center opacity-50 select-none">
