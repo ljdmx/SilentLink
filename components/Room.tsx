@@ -21,6 +21,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [isRemoteMuted, setIsRemoteMuted] = useState(false);
   const [isRemoteHidden, setIsRemoteHidden] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
+  const [showLocalPreview, setShowLocalPreview] = useState(true); // 控制本地视频框显示
   
   // Derived state for easy access in JSX
   const localParticipant = participants.find(p => p.isLocal);
@@ -157,7 +158,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   }, [config.roomId, config.userName, config.passphrase, addParticipant]);
 
   const setupPeerConnection = async (remoteId: string, isOffer: boolean): Promise<RTCPeerConnection> => {
-    // Enhanced STUN configuration for better NAT traversal
     const pc = new RTCPeerConnection({ 
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -329,10 +329,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     setCurrentFilter(prev => prev === PrivacyFilter.BLACK ? PrivacyFilter.NONE : PrivacyFilter.BLACK);
   };
 
-  const resetHandshake = () => {
-    window.location.reload();
-  };
-
   return (
     <div className="flex flex-col h-[100dvh] bg-background overflow-hidden relative font-sans">
       <header className="h-12 lg:h-14 shrink-0 flex items-center justify-between px-3 lg:px-6 glass z-[60] m-2 rounded-xl lg:rounded-2xl border-none">
@@ -429,7 +425,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                             {handshakeTimer === 0 && (
                                 <div className="mt-8 pt-8 border-t border-white/5 text-center space-y-4 animate-in fade-in slide-in-from-bottom-2">
                                     <p className="text-[10px] text-red-400 font-bold uppercase tracking-widest">握手时间已耗尽，请确保双方环境畅通</p>
-                                    <button onClick={resetHandshake} className="px-6 py-2 bg-white/5 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-gray-400 hover:text-white transition-colors">重置节点</button>
+                                    <button onClick={() => window.location.reload()} className="px-6 py-2 bg-white/5 border border-white/10 rounded-full text-[9px] font-black uppercase tracking-widest text-gray-400 hover:text-white transition-colors">重置节点</button>
                                 </div>
                             )}
                         </div>
@@ -448,14 +444,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                   </div>
                 )}
               </div>
-              <div className="absolute bottom-20 lg:bottom-8 right-3 lg:right-8 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)]">
-                {localParticipant && <VideoCard participant={localParticipant} filter={currentFilter} />}
-              </div>
+              
+              {/* 本地视频预览框：移至左下角，并增加底部间距以避开底栏 */}
+              {showLocalPreview && localParticipant && (
+                <div className="absolute bottom-28 lg:bottom-32 left-4 lg:left-10 w-28 lg:w-64 aspect-video z-50 border-2 border-white/20 rounded-xl lg:rounded-2xl overflow-hidden shadow-[0_0_50px_rgba(0,0,0,0.5)] transition-all animate-in fade-in zoom-in-90 duration-300">
+                  <VideoCard participant={localParticipant} filter={currentFilter} />
+                </div>
+              )}
             </div>
           )}
         </div>
 
-        {/* 侧边聊天栏 - 移动端全屏 Overlay, 桌面端侧边栏 */}
+        {/* 侧边聊天栏 */}
         <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-[420px] glass transform transition-all duration-300 ease-[cubic-bezier(0.23,1,0.32,1)] z-[200] flex flex-col lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/90 shrink-0">
                 <div className="flex items-center gap-2.5">
@@ -472,13 +472,15 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         </div>
       </main>
 
-      {/* 优化后的控制底栏 */}
+      {/* 控制底栏 */}
       {connectionStatus === 'connected' && (
         <div className="fixed bottom-4 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-1.5 lg:gap-8 p-2 lg:p-4 glass rounded-[2.5rem] lg:rounded-[3.5rem] z-[120] shadow-[0_30px_60px_-15px_rgba(0,0,0,0.8)] border border-white/10 animate-in slide-in-from-bottom-8">
           <div className="flex items-center gap-1 lg:gap-3 px-1.5">
             <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={toggleMyMic} danger={isMuted} label="静音" />
             <ControlBtn icon="blur_on" active={currentFilter === PrivacyFilter.MOSAIC} onClick={toggleMyPrivacy} label="马赛克" />
-            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏闭画面" />
+            <ControlBtn icon={currentFilter === PrivacyFilter.BLACK ? 'visibility_off' : 'videocam'} active={currentFilter !== PrivacyFilter.BLACK} onClick={toggleMyVideo} danger={currentFilter === PrivacyFilter.BLACK} label="屏蔽画面" />
+            {/* 新增本地预览显示/隐藏按钮 */}
+            <ControlBtn icon={showLocalPreview ? 'picture_in_picture' : 'picture_in_picture_alt'} active={showLocalPreview} onClick={() => setShowLocalPreview(!showLocalPreview)} label="预览开关" />
           </div>
           <div className="w-px h-8 bg-white/10 mx-1"></div>
           <div className="flex items-center gap-1 lg:gap-3 px-1.5">
@@ -504,7 +506,7 @@ const ControlBtn = ({ icon, active, onClick, danger, label, badge }: { icon: str
       <span className="material-symbols-outlined text-[20px] lg:text-[26px]">{icon}</span>
       {badge && <span className="absolute top-0 right-0 size-2 bg-primary rounded-full ring-2 ring-black"></span>}
     </button>
-    <span className="text-[7px] lg:text-[10px] font-black uppercase text-gray-600 tracking-tighter hidden md:block">{label}</span>
+    <span className="text-[7px] lg:text-[10px] font-black uppercase text-gray-600 tracking-tighter hidden md:block whitespace-nowrap">{label}</span>
   </div>
 );
 
@@ -560,7 +562,8 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
                     ) : (
                         <div className="p-4 lg:p-5 flex items-center gap-4 bg-black/20">
                             <div className="size-11 rounded-xl bg-white/5 flex items-center justify-center border border-white/10">
-                                <span className="material-symbols-outlined text-xl">lab_profile</span>
+                                {/* 文件图标更改为 link 图标 */}
+                                <span className="material-symbols-outlined text-xl">link</span>
                             </div>
                             <div className="flex flex-col min-w-0">
                                 <span className="text-[11px] font-bold truncate pr-6 text-white">{m.fileName}</span>
@@ -578,7 +581,6 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
         ))}
       </div>
       
-      {/* 针对移动端优化的高度 */}
       <div className="absolute bottom-0 inset-x-0 p-4 lg:p-6 bg-gradient-to-t from-black via-black/95 to-transparent backdrop-blur-sm border-t border-white/5 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
         <form onSubmit={handleSubmit} className="flex gap-3 max-w-4xl mx-auto">
           <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 active:scale-95 transition-all">
