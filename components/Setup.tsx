@@ -39,7 +39,7 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
         </button>
 
         <h1 className="text-2xl lg:text-4xl font-black mb-2 tracking-tight text-white relative z-10">配置安全节点</h1>
-        <p className="text-gray-500 mb-8 lg:mb-12 font-medium text-sm lg:text-base relative z-10">进入房间前，请确保您与对端使用相同的<span className="text-primary">房间 ID</span>和<span className="text-primary">会话口令</span>。</p>
+        <p className="text-gray-500 mb-8 lg:mb-12 font-medium text-sm lg:text-base relative z-10">进入房间前，请设置<span className="text-primary">房间 ID</span>和<span className="text-primary">会话口令</span>。</p>
 
         <form onSubmit={handleSubmit} className="space-y-6 lg:space-y-8 relative z-10">
           <div className="space-y-6">
@@ -82,7 +82,7 @@ const Setup: React.FC<SetupProps> = ({ onBack, onStart, onViewDesign }) => {
                   required
                   type="password"
                   className="w-full h-14 bg-black/40 border border-white/5 rounded-2xl px-5 focus:ring-2 focus:ring-primary outline-none transition-all placeholder:text-gray-700 text-white"
-                  placeholder="双方口令必须完全一致"
+                  placeholder="加密口令"
                   value={passphrase}
                   onChange={(e) => setPassphrase(e.target.value)}
                 />

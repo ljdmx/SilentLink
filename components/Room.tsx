@@ -19,6 +19,8 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
   const [currentFilter, setCurrentFilter] = useState<PrivacyFilter>(config.defaultFilter);
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
+  const [isRemoteMuted, setIsRemoteMuted] = useState(false);
+  const [isRemoteHidden, setIsRemoteHidden] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
   
   const [role, setRole] = useState<HandshakeRole>('none');
@@ -56,7 +58,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     dataChannelsRef.current.delete(id);
   }, []);
 
-  // 视频滤镜处理引擎
+  // 视频滤镜处理引擎 - 确保对方看到的也是马赛克
   useEffect(() => {
     let animationFrame: number;
     const canvas = filterCanvasRef.current;
@@ -92,16 +94,10 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       animationFrame = requestAnimationFrame(render);
     };
 
-    const startProcessing = () => {
-      if (rawStreamRef.current) {
-        video.srcObject = rawStreamRef.current;
-        video.play().then(() => render()).catch(e => console.error("Filter process failed", e));
-      }
-    };
-
     const interval = setInterval(() => {
         if (rawStreamRef.current && video.srcObject !== rawStreamRef.current) {
-            startProcessing();
+            video.srcObject = rawStreamRef.current;
+            video.play().then(() => render()).catch(e => console.error("Filter engine failed", e));
         }
     }, 1000);
 
@@ -131,7 +127,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         });
         rawStreamRef.current = stream;
 
-        // 捕获经过 Canvas 处理的流，确保对方看到的也是马赛克
         const canvasStream = (filterCanvasRef.current as any).captureStream(30);
         const audioTrack = stream.getAudioTracks()[0];
         if (audioTrack) canvasStream.addTrack(audioTrack);
@@ -139,10 +134,9 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 
         addParticipant({ id: 'local', name: config.userName, isLocal: true, isHost: true, audioEnabled: true, videoEnabled: true, stream: canvasStream });
       } catch (err) { 
-        console.error("Media error:", err); 
+        console.error("Media init error:", err); 
       }
 
-      // 自动入场逻辑优化
       const hash = window.location.hash;
       if (hash.includes('offer=')) {
         const params = new URLSearchParams(hash.substring(1));
@@ -150,11 +144,11 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         if (offerData) {
           setRemoteSDPInput(offerData);
           setRole('receiver');
-          // 增加解析前的缓冲时间，确保本地流和 ICE 就绪
+          // 增加解析前的缓冲时间，确保本地媒体和 ICE 堆栈就绪
           setTimeout(() => {
             const parseBtn = document.getElementById('auto-action-trigger');
             if (parseBtn) parseBtn.click();
-          }, 1500);
+          }, 2000);
         }
       }
     };
@@ -171,18 +165,15 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     peersRef.current.set(remoteId, pc);
     
-    // 发送处理后的加密流
     processedStreamRef.current?.getTracks().forEach(track => { 
       if (processedStreamRef.current) pc.addTrack(track, processedStreamRef.current); 
     });
 
     pc.ontrack = (e) => { 
-      console.log("Remote track received:", e.streams[0]);
-      addParticipant({ id: remoteId, name: "远端节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
+      addParticipant({ id: remoteId, name: "远端对等节点", isLocal: false, isHost: false, audioEnabled: true, videoEnabled: true, stream: e.streams[0] }); 
     };
 
     pc.onconnectionstatechange = () => {
-      console.log("PC State:", pc.connectionState);
       if (pc.connectionState === 'connected') setConnectionStatus('connected');
       if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
         removeParticipant(remoteId);
@@ -193,7 +184,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     };
 
     if (isOffer) {
-      const dc = pc.createDataChannel('secure-tunnel', { ordered: true });
+      const dc = pc.createDataChannel('secure-chat-tunnel', { ordered: true });
       setupDataChannel(remoteId, dc);
     } else { 
       pc.ondatachannel = (e) => setupDataChannel(remoteId, e.channel); 
@@ -214,7 +205,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             handleFileMetaReceive(payload);
           }
         } catch (err) { 
-          console.error("Payload error:", err); 
+          console.error("Payload parse failed:", err); 
         }
       } else {
         handleFileChunkReceive(e.data);
@@ -229,7 +220,6 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
     const offer = await pc.createOffer(); 
     await pc.setLocalDescription(offer);
     
-    // 确保 ICE 收集完整
     const onIceComplete = () => {
       if (pc.iceGatheringState === 'complete') {
         const sdp = btoa(JSON.stringify(pc.localDescription));
@@ -248,7 +238,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       const decoded = JSON.parse(atob(remoteSDPInput));
       const pc = peersRef.current.get('peer');
       if (pc) await pc.setRemoteDescription(new RTCSessionDescription(decoded));
-    } catch (e) { alert("代码异常，请重新复制"); }
+    } catch (e) { alert("握手响应无效，请确认代码是否完整"); }
   };
 
   const handleOfferAndReply = async () => {
@@ -270,7 +260,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       };
       pc.onicegatheringstatechange = onIceComplete;
       if (pc.iceGatheringState === 'complete') onIceComplete();
-    } catch (e) { alert("Offer 解析失败"); }
+    } catch (e) { alert("握手包解析失败"); }
   };
 
   const getInviteLink = () => {
@@ -294,7 +284,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
       if (hasSent) {
         setMessages(prev => [...prev, { id: Date.now().toString(), senderId: 'local', senderName: config.userName, text, type: 'text', timestamp: Date.now() }]);
       }
-    } catch (e) { console.error("Send failed", e); }
+    } catch (e) { console.error("Message encryption or sending failed", e); }
   };
 
   const handleFileUpload = async (file: File) => {
@@ -350,7 +340,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
         setFiles(prev => prev.map(f => f.id === state.id ? { ...f, status: 'completed' } : f));
         receivingFileRef.current = null;
       }
-    } catch (e) { console.error("File decode error:", e); }
+    } catch (e) { console.error("File chunk decryption failed", e); }
   };
 
   const remoteParticipant = participants.find(p => !p.isLocal);
@@ -371,7 +361,7 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
             </div>
           </div>
         </div>
-        <button onClick={onExit} className="h-8 px-4 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 text-[10px] font-black uppercase tracking-widest transition-all">物理切断</button>
+        <button onClick={onExit} className="h-8 px-4 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-500 text-[10px] font-black uppercase tracking-widest transition-all">物理断开</button>
       </header>
 
       <main className="flex-1 flex overflow-hidden relative p-2 pt-0">
@@ -381,17 +371,17 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 {role === 'none' ? (
                     <div className="text-center space-y-12 max-w-2xl animate-in zoom-in-95">
                         <div className="space-y-4">
-                            <h3 className="text-4xl lg:text-6xl font-black text-white tracking-tighter uppercase italic leading-none">节点确认</h3>
-                            <p className="text-gray-500 text-[10px] font-black uppercase tracking-[0.4em]">请确认您的接入身份以同步加密通道</p>
+                            <h3 className="text-4xl lg:text-6xl font-black text-white tracking-tighter uppercase italic leading-none">身份握手中</h3>
+                            <p className="text-gray-500 text-[10px] font-black uppercase tracking-[0.4em]">检测到入场信号，请确认您的节点角色</p>
                         </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-3xl">
                             <button onClick={startAsInitiator} className="group flex flex-col items-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-primary/10 hover:border-primary/40 transition-all active:scale-95 shadow-xl">
                                 <span className="material-symbols-outlined text-5xl text-primary animate-pulse">rocket_launch</span>
-                                <h4 className="text-xl font-black text-white uppercase tracking-widest">发起接入</h4>
+                                <h4 className="text-xl font-black text-white uppercase tracking-widest">发起节点</h4>
                             </button>
                             <button onClick={() => setRole('receiver')} className="group flex flex-col items-center gap-6 p-10 lg:p-14 glass rounded-[3rem] border-accent/10 hover:border-accent/40 transition-all active:scale-95 shadow-xl">
                                 <span className="material-symbols-outlined text-5xl text-accent">join_inner</span>
-                                <h4 className="text-xl font-black text-white uppercase tracking-widest">接收接入</h4>
+                                <h4 className="text-xl font-black text-white uppercase tracking-widest">接收节点</h4>
                             </button>
                         </div>
                     </div>
@@ -411,17 +401,17 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                                     {handshakeStep === 2 && (
                                         <div className="space-y-10 animate-in zoom-in-95">
                                             <div className="space-y-4">
-                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 1 步：分发魔术链接</h4>
+                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 1 步：复制魔术链接</h4>
                                                 <button onClick={() => {navigator.clipboard.writeText(getInviteLink()); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-20 bg-primary/10 border-2 border-primary/30 hover:border-primary text-primary rounded-[2rem] font-black uppercase tracking-widest flex items-center justify-center gap-4 transition-all shadow-xl active:scale-95">
                                                     <span className="material-symbols-outlined text-2xl">{isCopied ? 'check_circle' : 'share'}</span>
-                                                    <span className="text-lg">{isCopied ? '魔术链接已复制' : '复制安全邀请链接'}</span>
+                                                    <span className="text-lg">{isCopied ? '链接已就绪' : '生成邀请链接'}</span>
                                                 </button>
                                             </div>
                                             <div className="space-y-4 text-left">
-                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 2 步：同步对端响应</h4>
+                                                <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">第 2 步：激活远程节点代码</h4>
                                                 <div className="relative">
-                                                    <textarea placeholder="粘贴对方返回的代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none resize-none transition-all" />
-                                                    <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-4 right-4 h-12 px-8 bg-accent text-black rounded-xl font-black uppercase tracking-widest active:scale-95 disabled:opacity-30">激活连接</button>
+                                                    <textarea placeholder="粘贴对方返回的代码包..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none resize-none transition-all" />
+                                                    <button onClick={finalizeAsInitiator} disabled={!remoteSDPInput} className="absolute bottom-4 right-4 h-12 px-8 bg-accent text-black rounded-xl font-black uppercase tracking-widest active:scale-95 disabled:opacity-30">连接节点</button>
                                                 </div>
                                             </div>
                                         </div>
@@ -430,15 +420,15 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                             ) : (
                                 <div className="space-y-10">
                                     <div className="space-y-4">
-                                        <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">解析加密请求</h4>
-                                        <textarea placeholder="此处粘贴来自发起方的 Offer 代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none focus:border-accent/40" />
-                                        <button id="auto-action-trigger" onClick={handleOfferAndReply} className="w-full h-16 bg-white/5 border border-white/10 text-white rounded-[2rem] font-black uppercase tracking-widest hover:bg-white/10 active:scale-95 transition-all">确认并生成响应代码</button>
+                                        <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">同步初始化请求</h4>
+                                        <textarea placeholder="此处粘贴来自发起方的请求代码..." value={remoteSDPInput} onChange={(e) => setRemoteSDPInput(e.target.value)} className="w-full h-32 bg-black/60 border border-white/10 rounded-[2rem] p-6 text-[10px] font-mono text-accent outline-none focus:border-accent/40" />
+                                        <button id="auto-action-trigger" onClick={handleOfferAndReply} className="w-full h-16 bg-white/5 border border-white/10 text-white rounded-[2rem] font-black uppercase tracking-widest hover:bg-white/10 active:scale-95 transition-all">确认解析并生成响应</button>
                                     </div>
                                     {handshakeStep === 2 && (
                                         <div className="space-y-4 animate-in slide-in-from-top-4">
-                                            <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">同步响应回对端</h4>
+                                            <h4 className="text-[11px] font-black text-white uppercase tracking-widest px-2">将响应代码传回对方</h4>
                                             <button onClick={() => {navigator.clipboard.writeText(localSDP); setIsCopied(true); setTimeout(()=>setIsCopied(false), 2000);}} className="w-full h-16 bg-accent text-black rounded-[2rem] font-black uppercase tracking-widest shadow-xl shadow-accent/20 active:scale-95 transition-all">
-                                                {isCopied ? '响应代码已复制' : '复制响应代码给发起方'}
+                                                {isCopied ? '响应包已复制' : '复制响应代码'}
                                             </button>
                                         </div>
                                     )}
@@ -457,53 +447,91 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
                 ) : (
                   <div className="w-full h-full flex flex-col items-center justify-center space-y-6 opacity-40">
                     <div className="size-16 rounded-full border-[3px] border-primary/20 border-t-primary animate-spin"></div>
-                    <p className="text-xs font-black uppercase tracking-[0.5em] text-white italic">载荷流同步中...</p>
+                    <p className="text-xs font-black uppercase tracking-[0.5em] text-white italic">载荷流建立中...</p>
                   </div>
                 )}
               </div>
 
-              {/* 本地画面 (悬浮) - 优化移动端位置，上移避开控制栏 */}
-              <div className="absolute bottom-28 lg:bottom-8 left-4 lg:left-8 w-40 lg:w-72 aspect-video z-50 transition-all duration-500 hover:scale-[1.05] border-2 border-white/10 rounded-2xl lg:rounded-[2rem] overflow-hidden shadow-2xl shadow-black">
+              {/* 本地画面 (悬浮预览) - 显著上移以避开底部功能栏 */}
+              <div className="absolute bottom-32 lg:bottom-12 right-4 lg:right-10 w-36 lg:w-72 aspect-video z-50 transition-all duration-500 hover:scale-[1.05] border-2 border-white/10 rounded-2xl lg:rounded-[2rem] overflow-hidden shadow-2xl shadow-black">
                 {localParticipant && (
                   <VideoCard participant={localParticipant} filter={currentFilter} />
                 )}
-                <div className="absolute top-2 left-2 px-1.5 py-0.5 bg-black/60 backdrop-blur-md rounded-md text-[7px] font-black text-white uppercase tracking-widest">
-                  本地加密流
-                </div>
               </div>
             </div>
           )}
         </div>
 
-        {/* E2EE 聊天侧板 */}
+        {/* 聊天侧边栏 */}
         <div className={`fixed inset-0 lg:static lg:inset-auto lg:w-96 glass transform transition-all duration-300 z-[110] flex flex-col lg:m-2 lg:rounded-2xl overflow-hidden ${isChatOpen ? 'translate-y-0 opacity-100' : 'translate-y-full lg:hidden opacity-0 scale-95 pointer-events-none'}`}>
              <div className="h-14 flex items-center justify-between px-6 border-b border-white/5 bg-black/40 shrink-0">
                 <div className="flex items-center gap-2">
                     <span className="size-2 rounded-full bg-accent animate-pulse shadow-[0_0_8px_#22c55e]"></span>
-                    <h3 className="text-[10px] font-black uppercase tracking-widest text-gray-400">加密数据通道</h3>
+                    <h3 className="text-[10px] font-black uppercase tracking-widest text-gray-400">E2EE 数据隧道</h3>
                 </div>
-                <button onClick={() => setIsChatOpen(false)} className="size-8 rounded-full hover:bg-white/10 flex items-center justify-center transition-colors">
-                    <span className="material-symbols-outlined text-lg text-gray-500">close</span>
+                <button onClick={() => setIsChatOpen(false)} className="size-8 rounded-full hover:bg-white/10 flex items-center justify-center transition-colors text-gray-500 hover:text-white">
+                    <span className="material-symbols-outlined text-lg">close</span>
                 </button>
              </div>
-             <div className="flex-1 overflow-hidden bg-[#080a0c] flex flex-col relative group/chat">
+             <div className="flex-1 overflow-hidden bg-[#080a0c] flex flex-col relative">
                 <ChatBox messages={messages} onSend={sendMessage} userName={config.userName} onUpload={handleFileUpload} />
              </div>
         </div>
       </main>
 
-      {/* 底部控制栏 - 优化响应式 z-index */}
+      {/* 优化后的控制底栏 */}
       {connectionStatus === 'connected' && (
-        <div className="fixed bottom-6 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-2 lg:gap-3 p-2.5 glass rounded-[2rem] z-[120] shadow-2xl shadow-black animate-in slide-in-from-bottom-10 border border-white/5">
-          <div className="flex items-center gap-1 bg-white/5 p-1 rounded-2xl mr-1">
+        <div className="fixed bottom-6 lg:bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-2 lg:gap-4 p-2.5 glass rounded-[2.5rem] z-[120] shadow-[0_20px_50px_rgba(0,0,0,0.8)] border border-white/10 animate-in slide-in-from-bottom-10">
+          
+          {/* 前三个：控制自己的隐私滤镜 */}
+          <div className="flex items-center gap-1 bg-white/5 p-1 rounded-2xl">
               <FilterBtn active={currentFilter === PrivacyFilter.NONE} icon="visibility" onClick={() => setCurrentFilter(PrivacyFilter.NONE)} />
               <FilterBtn active={currentFilter === PrivacyFilter.MOSAIC} icon="grid_view" onClick={() => setCurrentFilter(PrivacyFilter.MOSAIC)} />
               <FilterBtn active={currentFilter === PrivacyFilter.BLACK} icon="videocam_off" onClick={() => setCurrentFilter(PrivacyFilter.BLACK)} />
           </div>
-          <ControlBtn icon={isMuted ? 'mic_off' : 'mic'} active={!isMuted} onClick={() => { const t = rawStreamRef.current?.getAudioTracks()[0]; if (t) { t.enabled = !t.enabled; setIsMuted(!t.enabled); } }} danger={isMuted} />
-          <ControlBtn icon={isVideoOff ? 'videocam_off' : 'videocam'} active={!isVideoOff} onClick={() => { const t = rawStreamRef.current?.getVideoTracks()[0]; if (t) { t.enabled = !t.enabled; setIsVideoOff(!t.enabled); } }} danger={isVideoOff} />
+
           <div className="w-px h-6 bg-white/10 mx-1"></div>
-          <ControlBtn icon="forum" active={isChatOpen} onClick={() => setIsChatOpen(true)} />
+
+          {/* 中间两个：控制自己的麦克风和摄像头 */}
+          <div className="flex items-center gap-2">
+            <ControlBtn 
+                icon={isMuted ? 'mic_off' : 'mic'} 
+                active={!isMuted} 
+                onClick={() => { const t = rawStreamRef.current?.getAudioTracks()[0]; if (t) { t.enabled = !t.enabled; setIsMuted(!t.enabled); } }} 
+                danger={isMuted} 
+            />
+            <ControlBtn 
+                icon={isVideoOff ? 'videocam_off' : 'videocam'} 
+                active={!isVideoOff} 
+                onClick={() => { const t = rawStreamRef.current?.getVideoTracks()[0]; if (t) { t.enabled = !t.enabled; setIsVideoOff(!t.enabled); } }} 
+                danger={isVideoOff} 
+            />
+          </div>
+
+          <div className="w-px h-6 bg-white/10 mx-1"></div>
+
+          {/* 后面两个：控制对方的静音和画面隐藏 (本地视觉控制) */}
+          <div className="flex items-center gap-2">
+            <ControlBtn 
+                icon={isRemoteMuted ? 'volume_off' : 'volume_up'} 
+                active={!isRemoteMuted} 
+                onClick={() => setIsRemoteMuted(!isRemoteMuted)} 
+                danger={isRemoteMuted}
+                label="对端音量"
+            />
+            <ControlBtn 
+                icon={isRemoteHidden ? 'visibility_off' : 'person'} 
+                active={!isRemoteHidden} 
+                onClick={() => setIsRemoteHidden(!isRemoteHidden)} 
+                danger={isRemoteHidden}
+                label="对端画面"
+            />
+          </div>
+
+          <div className="w-px h-6 bg-white/10 mx-1"></div>
+
+          {/* 最后一个：控制聊天面板 */}
+          <ControlBtn icon="forum" active={isChatOpen} onClick={() => setIsChatOpen(!isChatOpen)} />
         </div>
       )}
     </div>
@@ -511,15 +539,18 @@ const Room: React.FC<RoomProps> = ({ config, onExit }) => {
 };
 
 const FilterBtn = ({ active, icon, onClick }: { active: boolean; icon: string; onClick: () => void }) => (
-  <button onClick={onClick} className={`size-8 lg:size-10 rounded-lg flex items-center justify-center transition-all ${active ? 'bg-primary text-white shadow-lg' : 'text-gray-500 hover:text-white hover:bg-white/10'}`}>
-    <span className="material-symbols-outlined text-[18px] lg:text-[20px]">{icon}</span>
+  <button onClick={onClick} className={`size-9 lg:size-11 rounded-full flex items-center justify-center transition-all ${active ? 'bg-primary text-white shadow-lg' : 'text-gray-500 hover:text-white hover:bg-white/10'}`}>
+    <span className="material-symbols-outlined text-[20px] lg:text-[22px]">{icon}</span>
   </button>
 );
 
-const ControlBtn = ({ icon, active, onClick, danger }: { icon: string; active: boolean; onClick: () => void; danger?: boolean }) => (
-  <button onClick={onClick} className={`size-10 lg:size-12 rounded-full flex items-center justify-center transition-all border ${active ? 'bg-white/5 border-white/10 text-white' : (danger ? 'bg-red-500/20 border-red-500/20 text-red-500' : 'bg-white/5 border-white/5 text-gray-500')} hover:scale-105 active:scale-90`}>
-    <span className="material-symbols-outlined text-[18px] lg:text-[20px]">{icon}</span>
-  </button>
+const ControlBtn = ({ icon, active, onClick, danger, label }: { icon: string; active: boolean; onClick: () => void; danger?: boolean; label?: string }) => (
+  <div className="flex flex-col items-center gap-1 group">
+    <button onClick={onClick} className={`size-10 lg:size-12 rounded-full flex items-center justify-center transition-all border ${active ? 'bg-white/5 border-white/10 text-white' : (danger ? 'bg-red-500/20 border-red-500/20 text-red-500' : 'bg-white/5 border-white/5 text-gray-500')} hover:scale-105 active:scale-90 relative overflow-hidden`}>
+      <span className="material-symbols-outlined text-[20px] lg:text-[22px]">{icon}</span>
+    </button>
+    {label && <span className="text-[7px] lg:text-[8px] font-black uppercase text-gray-600 opacity-0 group-hover:opacity-100 transition-opacity tracking-widest">{label}</span>}
+  </div>
 );
 
 const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessage[]; onSend: (t: string) => void; userName: string; onUpload: (f: File) => void }) => {
@@ -551,7 +582,7 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 z-20 backdrop-blur-sm pointer-events-none border-2 border-dashed border-primary m-4 rounded-2xl">
            <div className="text-center">
              <span className="material-symbols-outlined text-5xl text-primary animate-bounce">upload_file</span>
-             <p className="text-xs font-black uppercase tracking-widest text-primary mt-2">释放以同步加密文件</p>
+             <p className="text-xs font-black uppercase tracking-widest text-primary mt-2">释放以发送加密文件</p>
            </div>
         </div>
       )}
@@ -572,7 +603,7 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
                      </span>
                      <p className="text-[9px] font-mono truncate opacity-60 uppercase tracking-tighter">{m.fileName}</p>
                    </div>
-                   <a href={m.blobUrl} download={m.fileName} className="size-7 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center">
+                   <a href={m.blobUrl} download={m.fileName} className="size-7 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center transition-colors">
                      <span className="material-symbols-outlined text-sm">download</span>
                    </a>
                  </div>
@@ -584,7 +615,7 @@ const ChatBox = ({ messages, onSend, userName, onUpload }: { messages: ChatMessa
 
       <div className="p-4 bg-black/60 border-t border-white/5 shrink-0 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
         <form onSubmit={(e) => { e.preventDefault(); if (text.trim()) { onSend(text); setText(''); } }} className="relative flex gap-2">
-          <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 active:scale-90">
+          <label className="shrink-0 size-12 bg-white/5 border border-white/10 text-gray-400 rounded-xl flex items-center justify-center cursor-pointer hover:bg-white/10 transition-all active:scale-90">
               <input type="file" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) onUpload(f); }} />
               <span className="material-symbols-outlined">attach_file</span>
           </label>
